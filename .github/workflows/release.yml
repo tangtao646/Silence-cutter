@@ -90,7 +90,7 @@ jobs:
           tagName: v__VERSION__ # tauri-action replaces this with version from package.json
           releaseName: "Silence Cutter v__VERSION__"
           releaseBody: "See the assets below to download the latest version of Silence Cutter."
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
 
