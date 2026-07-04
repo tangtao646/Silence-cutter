@@ -223,30 +223,31 @@ impl ProgressNotifier {
         Self { window }
     }
 
-    fn emit(&self, percent: f64, message: &str, eta: f64) {
+    fn emit(&self, percent: f64, message_key: &str, params: serde_json::Value, eta: f64) {
         if let Some(ref win) = self.window {
             let _ = win.emit("video-progress", serde_json::json!({
                 "percent": percent,
-                "message": message,
+                "message_key": message_key,
+                "params": params,
                 "eta": eta
             }));
         }
     }
 
     fn emit_probe_start(&self) {
-        self.emit(0.5, "正在获取视频信息 (ffprobe)...", 0.0);
+        self.emit(0.5, "probe_start", serde_json::json!({}), 0.0);
     }
 
     fn emit_analysis(&self) {
-        self.emit(1.0, "正在分析片段逻辑...", 0.0);
+        self.emit(1.0, "analysis", serde_json::json!({}), 0.0);
     }
 
     fn emit_init_parallel(&self, num_batches: usize) {
-        self.emit(2.0, &format!("正在初始化并行渲染引擎 (共 {} 组)...", num_batches), 0.0);
+        self.emit(2.0, "init_parallel", serde_json::json!({"batches": num_batches}), 0.0);
     }
 
     fn emit_submit_batch(&self, batch_idx: usize, num_batches: usize) {
-        self.emit(2.0, &format!("正在提交并行转码任务: {}/{}", batch_idx + 1, num_batches), 0.0);
+        self.emit(2.0, "submit_batch", serde_json::json!({"current": batch_idx + 1, "total": num_batches}), 0.0);
     }
 
     fn emit_batch_completed(&self, completed: usize, num_batches: usize, elapsed: f64) {
@@ -255,15 +256,15 @@ impl ProgressNotifier {
         let eta = avg_time_per_batch * remaining_batches as f64;
         let progress = 1.0 + (completed as f64 / num_batches as f64 * 90.0);
 
-        self.emit(progress, &format!("正在转码: 第 {}/{} 组已完成", completed, num_batches), eta);
+        self.emit(progress, "batch_completed", serde_json::json!({"completed": completed, "total": num_batches}), eta);
     }
 
     fn emit_merging(&self) {
-        self.emit(95.0, "正在进行最后的无损合并...", 1.0);
+        self.emit(95.0, "merging", serde_json::json!({}), 1.0);
     }
 
     fn emit_complete(&self) {
-        self.emit(100.0, "处理完成", 0.0);
+        self.emit(100.0, "complete", serde_json::json!({}), 0.0);
     }
 }
 

@@ -3,10 +3,40 @@ import { translations } from './translations';
 
 const I18nContext = createContext();
 
+const getInitialLanguage = () => {
+  try {
+    // 1. 优先遵循用户在软件内手动切换并保存的语言
+    const savedLang = localStorage.getItem('app_lang');
+    if (savedLang === 'zh' || savedLang === 'en') {
+      return savedLang;
+    }
+
+    // 2. 如果没有缓存，读取系统/浏览器环境语言
+    // 现代 Mac 系统的 Webview 容器会提供系统首选语言列表
+    const systemLanguages = navigator.languages || [navigator.language];
+    
+    for (const lang of systemLanguages) {
+      if (!lang) continue;
+      const lowerLang = lang.toLowerCase();
+      if (lowerLang.startsWith('zh')) {
+        return 'zh';
+      }
+      if (lowerLang.startsWith('en')) {
+        return 'en';
+      }
+    }
+  } catch (e) {
+    console.error("Failed to detect system language, fallback to english.", e);
+  }
+
+  // 3. 兜底策略：既然你是要上架微软商店，为了通过审核，兜底必须是英文（en）
+  // 这样任何海外审核员打开，如果系统不是中文，一律默认显示英文，100% 安全
+  return 'en';
+};
+
 export function I18nProvider({ children }) {
-  const [language, setLanguage] = useState(() => {
-    return localStorage.getItem('app_lang') || 'zh';
-  });
+  // 💡 使用智能获取的语言作为状态初值
+  const [language, setLanguage] = useState(getInitialLanguage);
 
   useEffect(() => {
     localStorage.setItem('app_lang', language);

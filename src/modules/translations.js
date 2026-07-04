@@ -65,6 +65,15 @@ export const translations = {
     timeline: {
       add_mask: '添加静音遮罩',
     },
+    progress: {
+      probe_start: '正在获取视频信息 (ffprobe)...',
+      analysis: '正在分析片段逻辑...',
+      init_parallel: '正在初始化并行渲染引擎 (共 {{batches}} 组)...',
+      submit_batch: '正在提交并行转码任务: {{current}}/{{total}}',
+      batch_completed: '正在转码: 第 {{completed}}/{{total}} 组已完成',
+      merging: '正在进行最后的无损合并...',
+      complete: '处理完成',
+    },
     export: {
       title: '正在渲染导出',
       preparing: '正在准备导出参数...',
@@ -154,6 +163,15 @@ export const translations = {
     },
     timeline: {
       add_mask: 'Add Silence Mask',
+    },
+    progress: {
+      probe_start: 'Fetching video information (ffprobe)...',
+      analysis: 'Analyzing segment logic...',
+      init_parallel: 'Initializing parallel rendering engine ({{batches}} batches)...',
+      submit_batch: 'Submitting parallel transcode tasks: {{current}}/{{total}}',
+      batch_completed: 'Transcoding: batch {{completed}}/{{total}} completed',
+      merging: 'Performing final lossless merge...',
+      complete: 'Processing complete',
     },
     export: {
       title: 'Exporting Video',

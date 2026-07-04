@@ -575,9 +575,11 @@ const MainInterface = ({ appData, isTauri }) => {
         const setupListener = async () => {
             if (appData.tauri && appData.tauri.listen) {
                 const unlisten = await appData.tauri.listen('video-progress', (event) => {
-                    const { percent, message, eta } = event.payload;
+                    const { percent, message_key, params, eta } = event.payload;
                     if (percent !== undefined) setExportProgress(percent);
-                    if (message !== undefined) setExportMessage(message);
+                    if (message_key !== undefined) {
+                        setExportMessage(t(`progress.${message_key}`, params || {}));
+                    }
                     if (eta !== undefined) setExportEta(eta);
                 });
                 
@@ -594,7 +596,7 @@ const MainInterface = ({ appData, isTauri }) => {
             isCancelled = true;
             if (unlistenFn) unlistenFn();
         };
-    }, [appData.tauri]);
+    }, [appData.tauri, language]);
 
     // 实现虚拟剪辑播放逻辑：自动跳过已经“确认物理剪除”的静音片段
     useEffect(() => {
