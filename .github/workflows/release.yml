@@ -92,5 +92,5 @@ jobs:
           releaseBody: "See the assets below to download the latest version of Silence Cutter."
           releaseDraft: false
           prerelease: false
-         args: ${{ matrix.platform == 'windows-latest' && '--bundles msix' || matrix.args }}
+          args: ${{ matrix.platform == 'windows-latest' && '--bundles msix' || matrix.args }}
 
