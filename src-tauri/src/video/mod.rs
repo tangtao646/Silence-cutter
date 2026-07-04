@@ -176,7 +176,342 @@ struct SpeechSegment {
     end: f64,
 }
 
-// 从视频移除静音 (加速并行版)
+// ============================================================
+// 重构：将 remove_silence_from_video 拆分为多个职责单一的子模块
+// ============================================================
+
+/// 说话片段计算器：从静音片段列表计算出需要保留的说话片段
+struct SpeechSegmentCalculator;
+
+impl SpeechSegmentCalculator {
+    /// 从静音片段和视频总时长计算说话片段
+    fn calculate(silences: &[SilenceSegment], original_duration: f64) -> Vec<SpeechSegment> {
+        let mut speech_segments = Vec::new();
+        let mut last_end = 0.0;
+        
+        // 增加一个小于 0.1s 的容差，避免各种浮点数精度或 ffprobe 误差导致的"幽灵尾巴"
+        let timestamp_tolerance = 0.05;
+
+        for silence in silences {
+            // 如果当前静音开始时间远大于上一个结束时间，说明中间有一段说话
+            if silence.start_time > last_end + timestamp_tolerance {
+                speech_segments.push(SpeechSegment { start: last_end, end: silence.start_time });
+            }
+            last_end = silence.end_time;
+        }
+
+        // 处理最后一段说话（直到视频结束）
+        // 特别注意：如果最后一段太短（比如小于 0.1s），通常是 ffprobe 时长的误差，应该直接忽略
+        if last_end < original_duration - 0.1 {
+            speech_segments.push(SpeechSegment { start: last_end, end: original_duration });
+        }
+
+        // 再次过滤：删除任何由于逻辑计算产生的极短片段（小于一个 GOB 或一帧的量级）
+        speech_segments.retain(|s| (s.end - s.start) > 0.05);
+
+        speech_segments
+    }
+}
+
+/// 进度通知器：封装所有与 tauri::Window 相关的进度通知逻辑
+struct ProgressNotifier {
+    window: Option<tauri::Window>,
+}
+
+impl ProgressNotifier {
+    fn new(window: Option<tauri::Window>) -> Self {
+        Self { window }
+    }
+
+    fn emit(&self, percent: f64, message: &str, eta: f64) {
+        if let Some(ref win) = self.window {
+            let _ = win.emit("video-progress", serde_json::json!({
+                "percent": percent,
+                "message": message,
+                "eta": eta
+            }));
+        }
+    }
+
+    fn emit_probe_start(&self) {
+        self.emit(0.5, "正在获取视频信息 (ffprobe)...", 0.0);
+    }
+
+    fn emit_analysis(&self) {
+        self.emit(1.0, "正在分析片段逻辑...", 0.0);
+    }
+
+    fn emit_init_parallel(&self, num_batches: usize) {
+        self.emit(2.0, &format!("正在初始化并行渲染引擎 (共 {} 组)...", num_batches), 0.0);
+    }
+
+    fn emit_submit_batch(&self, batch_idx: usize, num_batches: usize) {
+        self.emit(2.0, &format!("正在提交并行转码任务: {}/{}", batch_idx + 1, num_batches), 0.0);
+    }
+
+    fn emit_batch_completed(&self, completed: usize, num_batches: usize, elapsed: f64) {
+        let avg_time_per_batch = elapsed / completed as f64;
+        let remaining_batches = num_batches - completed;
+        let eta = avg_time_per_batch * remaining_batches as f64;
+        let progress = 1.0 + (completed as f64 / num_batches as f64 * 90.0);
+
+        self.emit(progress, &format!("正在转码: 第 {}/{} 组已完成", completed, num_batches), eta);
+    }
+
+    fn emit_merging(&self) {
+        self.emit(95.0, "正在进行最后的无损合并...", 1.0);
+    }
+
+    fn emit_complete(&self) {
+        self.emit(100.0, "处理完成", 0.0);
+    }
+}
+
+/// 并行批次处理器：负责将说话片段分批并行转码
+struct BatchProcessor<'a> {
+    ffmpeg_path: &'a str,
+    input_path: &'a str,
+    temp_dir: &'a Path,
+    speech_segments: &'a [SpeechSegment],
+    has_video: bool,
+    original_bitrate: Option<u64>,
+    segments_per_batch: usize,
+    max_concurrent_tasks: usize,
+    notifier: &'a ProgressNotifier,
+    cancel_signal: &'a Arc<AtomicBool>,
+}
+
+impl<'a> BatchProcessor<'a> {
+    fn new(
+        ffmpeg_path: &'a str,
+        input_path: &'a str,
+        temp_dir: &'a Path,
+        speech_segments: &'a [SpeechSegment],
+        has_video: bool,
+        original_bitrate: Option<u64>,
+        notifier: &'a ProgressNotifier,
+        cancel_signal: &'a Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            ffmpeg_path,
+            input_path,
+            temp_dir,
+            speech_segments,
+            has_video,
+            original_bitrate,
+            segments_per_batch: 10,
+            max_concurrent_tasks: 4,
+            notifier,
+            cancel_signal,
+        }
+    }
+
+    /// 计算批次数量
+    fn num_batches(&self) -> usize {
+        (self.speech_segments.len() + self.segments_per_batch - 1) / self.segments_per_batch
+    }
+
+    /// 执行所有批次的并行转码
+    async fn process(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        let num_batches = self.num_batches();
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(self.max_concurrent_tasks));
+        let mut tasks = tokio::task::JoinSet::new();
+        let start_processing_time = std::time::Instant::now();
+
+        let ffmpeg_path_str = self.ffmpeg_path.to_string();
+        for batch_idx in 0..num_batches {
+            let start_idx = batch_idx * self.segments_per_batch;
+            let end_idx = (start_idx + self.segments_per_batch).min(self.speech_segments.len());
+            
+            let batch_segments = self.speech_segments[start_idx..end_idx].to_owned();
+            let input = self.input_path.to_string();
+            let batch_output = self.temp_dir.join(format!("part_{}.ts", batch_idx));
+            let has_video = self.has_video;
+            let sem = semaphore.clone();
+            let original_bitrate = self.original_bitrate;
+            let ffmpeg_cmd = ffmpeg_path_str.clone();
+
+            // 计算该批次的快速寻址起点：取该批第一个片段的 start
+            let seek_start = batch_segments[0].start;
+
+            self.notifier.emit_submit_batch(batch_idx, num_batches);
+
+            tasks.spawn(async move {
+                let _permit = sem.acquire().await.map_err(|e| format!("Semaphore error: {}", e))?;
+                process_batch_to_ts(
+                    &ffmpeg_cmd,
+                    &input, 
+                    batch_output.to_str().unwrap(), 
+                    &batch_segments, 
+                    has_video, 
+                    seek_start,
+                    original_bitrate
+                ).await
+            });
+        }
+
+        // 等待所有并行任务完成，同时监听取消信号
+        let completed = self.await_completion(&mut tasks, num_batches, start_processing_time).await?;
+        
+        Ok(completed)
+    }
+
+    /// 等待所有任务完成，支持取消信号和进度通知
+    async fn await_completion(
+        &self,
+        tasks: &mut tokio::task::JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+        num_batches: usize,
+        start_processing_time: std::time::Instant,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut completed = 0;
+        while completed < num_batches {
+            // 利用 tokio::select! 增强响应速度，避免 join_next() 阻塞期间无法响应取消信号
+            tokio::select! {
+                res = tasks.join_next() => {
+                    if let Some(join_res) = res {
+                        // 第一个 ? 处理 JoinError
+                        let batch_result = join_res.map_err(|e| format!("Parallel task panicked: {}", e))?;
+                        // 第二个 处理 batch 内部的 FFmpeg 错误
+                        batch_result.map_err(|e| format!("Batch processing error: {}", e))?;
+                        
+                        completed += 1;
+                        
+                        let elapsed = start_processing_time.elapsed().as_secs_f64();
+                        self.notifier.emit_batch_completed(completed, num_batches, elapsed);
+                    } else {
+                        break;
+                    }
+                }
+                // 每隔 100ms 检查一次取消信号，大幅降低延迟
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                    if self.cancel_signal.load(Ordering::SeqCst) {
+                        tasks.abort_all();
+                        return Err("EXPORT_CANCELLED".into());
+                    }
+                }
+            }
+        }
+        Ok(completed)
+    }
+}
+
+/// 片段合并器：使用 FFmpeg Concat Demuxer 合并临时 TS 片段
+struct ConcatMerger;
+
+impl ConcatMerger {
+    /// 合并指定数量的临时 TS 片段到最终输出文件
+    async fn merge(
+        ffmpeg_path: &str,
+        temp_dir: &Path,
+        output_path: &str,
+        num_batches: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let concat_file_path = temp_dir.join("list.txt");
+        let mut concat_file = fs::File::create(&concat_file_path)?;
+        for i in 0..num_batches {
+            // 确保按顺序写入
+            writeln!(concat_file, "file 'part_{}.ts'", i)?;
+        }
+        concat_file.flush()?;
+
+        let mut concat_cmd = TokioCommand::new(ffmpeg_path);
+        concat_cmd.args(&[
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_file_path.to_str().unwrap(),
+            "-c", "copy", // 仅仅是拷贝，不重编码，速度极快
+            "-movflags", "+faststart",
+            "-y",
+            output_path
+        ]);
+
+        let status = concat_cmd.status().await?;
+        
+        if !status.success() {
+            return Err("合并片段失败".into());
+        }
+        Ok(())
+    }
+}
+
+/// 处理结果构建器：负责构建 ProcessResult
+struct ProcessResultBuilder;
+
+impl ProcessResultBuilder {
+    fn build(
+        input_path: &str,
+        output_path: &str,
+        original_duration: f64,
+        processed_duration: f64,
+        silence_segments: usize,
+        total_silence_removed: f64,
+        processing_time: f64,
+        success: bool,
+        error_message: Option<String>,
+    ) -> ProcessResult {
+        ProcessResult {
+            input_path: input_path.to_string(),
+            output_path: output_path.to_string(),
+            original_duration,
+            processed_duration,
+            silence_segments,
+            total_silence_removed,
+            compression_ratio: if original_duration > 0.0 {
+                (total_silence_removed / original_duration) * 100.0
+            } else {
+                0.0
+            },
+            processing_time,
+            success,
+            error_message,
+        }
+    }
+}
+
+/// 临时目录管理器：负责创建和清理临时目录
+struct TempDirManager;
+
+impl TempDirManager {
+    /// 基于输出路径创建临时目录
+    fn create(output_path: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let mut temp_dir = PathBuf::from(output_path);
+        temp_dir.set_extension("temp_parts");
+        if temp_dir.exists() {
+            let _ = fs::remove_dir_all(&temp_dir);
+        }
+        fs::create_dir_all(&temp_dir)?;
+        Ok(temp_dir)
+    }
+
+    /// 清理临时目录
+    fn cleanup(temp_dir: &Path) {
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+}
+
+/// 取消信号检查器：封装取消信号的检查逻辑
+struct CancelChecker<'a> {
+    cancel_signal: &'a Arc<AtomicBool>,
+    temp_dir: &'a Path,
+}
+
+impl<'a> CancelChecker<'a> {
+    fn new(cancel_signal: &'a Arc<AtomicBool>, temp_dir: &'a Path) -> Self {
+        Self { cancel_signal, temp_dir }
+    }
+
+    /// 检查是否已取消，如果是则清理并返回错误
+    fn check(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.cancel_signal.load(Ordering::SeqCst) {
+            TempDirManager::cleanup(self.temp_dir);
+            println!("🛑 任务被用户取消，正在清理临时文件...");
+            return Err("EXPORT_CANCELLED".into());
+        }
+        Ok(())
+    }
+}
+
+// 从视频移除静音 (加速并行版) - 重构后版本
 pub async fn remove_silence_from_video(
     ffmpeg_path: &str,
     ffprobe_path: &str,
@@ -187,66 +522,29 @@ pub async fn remove_silence_from_video(
     cancel_signal: Arc<AtomicBool>,
 ) -> Result<ProcessResult, Box<dyn std::error::Error>> {
     let start_time = std::time::Instant::now();
-    
-    if let Some(ref win) = window {
-        let _ = win.emit("video-progress", serde_json::json!({
-            "percent": 0.5,
-            "message": "正在获取视频信息 (ffprobe)...",
-            "eta": 0.0
-        }));
-    }
+    let notifier = ProgressNotifier::new(window);
 
-    // 获取原始信息
+    // 阶段 1: 获取视频信息
+    notifier.emit_probe_start();
     let video_info = get_video_info(ffprobe_path, input_path).await?;
     let original_duration = video_info.duration;
 
-    if let Some(ref win) = window {
-        let _ = win.emit("video-progress", serde_json::json!({
-            "percent": 1.0,
-            "message": "正在分析片段逻辑...",
-            "eta": 0.0
-        }));
-    }
+    // 阶段 2: 分析片段
+    notifier.emit_analysis();
 
     if silences.is_empty() {
         fs::copy(input_path, output_path)?;
-        return Ok(ProcessResult {
-            input_path: input_path.to_string(),
-            output_path: output_path.to_string(),
-            original_duration,
-            processed_duration: original_duration,
-            silence_segments: 0,
-            total_silence_removed: 0.0,
-            compression_ratio: 0.0,
-            processing_time: start_time.elapsed().as_secs_f64(),
-            success: true,
-            error_message: None,
-        });
+        return Ok(ProcessResultBuilder::build(
+            input_path, output_path,
+            original_duration, original_duration,
+            0, 0.0,
+            start_time.elapsed().as_secs_f64(),
+            true, None,
+        ));
     }
 
-    // 1. 计算所有需要保留的“说话片段” (Speech Segments)
-    let mut speech_segments = Vec::new();
-    let mut last_end = 0.0;
-    
-    // 增加一个小于 0.1s 的容差，避免各种浮点数精度或 ffprobe 误差导致的“幽灵尾巴”
-    let timestamp_tolerance = 0.05;
-
-    for silence in silences {
-        // 如果当前静音开始时间远大于上一个结束时间，说明中间有一段说话
-        if silence.start_time > last_end + timestamp_tolerance {
-            speech_segments.push(SpeechSegment { start: last_end, end: silence.start_time });
-        }
-        last_end = silence.end_time;
-    }
-
-    // 处理最后一段说话（直到视频结束）
-    // 特别注意：如果最后一段太短（比如小于 0.1s），通常是 ffprobe 时长的误差，应该直接忽略
-    if last_end < original_duration - 0.1 {
-        speech_segments.push(SpeechSegment { start: last_end, end: original_duration });
-    }
-
-    // 再次过滤：删除任何由于逻辑计算产生的极短片段（小于一个 GOB 或一帧的量级）
-    speech_segments.retain(|s| (s.end - s.start) > 0.05);
+    // 阶段 3: 计算说话片段
+    let speech_segments = SpeechSegmentCalculator::calculate(silences, original_duration);
 
     if speech_segments.is_empty() {
         return Err("剪辑完成后没有剩余有效片段".into());
@@ -255,176 +553,53 @@ pub async fn remove_silence_from_video(
     let total_silence_removed: f64 = silences.iter().map(|s| s.duration).sum();
     let processed_duration = original_duration - total_silence_removed;
 
-    // 工业级标准优化：根据片段总数动态调整批次大小，兼顾并发性能与进度反馈
-    // 原 50 会导致长视频中进度条长时间卡在 1%，现改为 10-20
-    let segments_per_batch = 10;
-    let num_batches = (speech_segments.len() + segments_per_batch - 1) / segments_per_batch;
+    // 阶段 4: 创建临时目录
+    let temp_dir = TempDirManager::create(output_path)?;
+    let cancel_checker = CancelChecker::new(&cancel_signal, &temp_dir);
+
+    println!("🚀 工业级并行化: {} 片段 -> {} 批次 (每批 10)", 
+        speech_segments.len(), (speech_segments.len() + 9) / 10);
     
-    // 设置并发上限，根据 CPU 核心数动态调整 (通常 4-8)
-    let max_concurrent_tasks = 4;
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent_tasks));
-    
-    let mut temp_dir = PathBuf::from(output_path);
-    temp_dir.set_extension("temp_parts");
-    if temp_dir.exists() { let _ = fs::remove_dir_all(&temp_dir); }
-    fs::create_dir_all(&temp_dir)?;
+    notifier.emit_init_parallel((speech_segments.len() + 9) / 10);
 
-    println!("🚀 工业级并行化: {} 片段 -> {} 批次 (每批 {})", 
-        speech_segments.len(), num_batches, segments_per_batch);
-    
-    if let Some(ref win) = window {
-        let _ = win.emit("video-progress", serde_json::json!({
-            "percent": 2.0, 
-            "message": format!("正在初始化并行渲染引擎 (共 {} 组)...", num_batches),
-            "eta": 0.0
-        }));
-    }
+    // 阶段 5: 并行转码
+    let batch_processor = BatchProcessor::new(
+        ffmpeg_path,
+        input_path,
+        &temp_dir,
+        &speech_segments,
+        video_info.has_video,
+        video_info.bitrate,
+        &notifier,
+        &cancel_signal,
+    );
 
-    let mut tasks = tokio::task::JoinSet::new();
-    let start_processing_time = std::time::Instant::now();
+    let completed = batch_processor.process().await?;
 
-    let ffmpeg_path_str = ffmpeg_path.to_string();
-    for batch_idx in 0..num_batches {
-        let start_idx = batch_idx * segments_per_batch;
-        let end_idx = (start_idx + segments_per_batch).min(speech_segments.len());
-        
-        let batch_segments = speech_segments[start_idx..end_idx].to_owned();
-        let input = input_path.to_string();
-        let batch_output = temp_dir.join(format!("part_{}.ts", batch_idx));
-        let has_video = video_info.has_video;
-        let sem = semaphore.clone();
-        let original_bitrate = video_info.bitrate;
-        let ffmpeg_cmd = ffmpeg_path_str.clone();
+    // 阶段 6: 检查取消信号
+    cancel_checker.check()?;
 
-        // 计算该批次的快速寻址起点：取该批第一个片段的 start
-        let seek_start = batch_segments[0].start;
-
-        if let Some(ref win) = window {
-            let _ = win.emit("video-progress", serde_json::json!({
-                "percent": 2.0, 
-                "message": format!("正在提交并行转码任务: {}/{}", batch_idx + 1, num_batches),
-                "eta": 0.0
-            }));
-        }
-
-        tasks.spawn(async move {
-            let _permit = sem.acquire().await.map_err(|e| format!("Semaphore error: {}", e))?;
-            process_batch_to_ts(
-                &ffmpeg_cmd,
-                &input, 
-                batch_output.to_str().unwrap(), 
-                &batch_segments, 
-                has_video, 
-                seek_start,
-                original_bitrate
-            ).await
-        });
-    }
-
-    // 3. 等待所有并行任务完成
-    let mut completed = 0;
-    while completed < num_batches {
-        // 利用 tokio::select! 增强响应速度，避免 join_next() 阻塞期间无法响应取消信号
-        tokio::select! {
-            res = tasks.join_next() => {
-                if let Some(join_res) = res {
-                    // 第一个 ? 处理 JoinError
-                    let batch_result = join_res.map_err(|e| format!("Parallel task panicked: {}", e))?;
-                    // 第二个 处理 batch 内部的 FFmpeg 错误
-                    batch_result.map_err(|e| format!("Batch processing error: {}", e))?;
-                    
-                    completed += 1;
-                    
-                    if let Some(ref win) = window {
-                        let elapsed = start_processing_time.elapsed().as_secs_f64();
-                        let avg_time_per_batch = elapsed / completed as f64;
-                        let remaining_batches = num_batches - completed;
-                        let eta = avg_time_per_batch * remaining_batches as f64;
-
-                        // 进度从 2% 开始，到 92% 结束转码阶段
-                        let progress = 1.0 + (completed as f64 / num_batches as f64 * 90.0);
-
-                        let _ = win.emit("video-progress", serde_json::json!({
-                            "percent": progress,
-                            "message": format!("正在转码: 第 {}/{} 组已完成", completed, num_batches),
-                            "eta": eta
-                        }));
-                    }
-                } else {
-                    break;
-                }
-            }
-            // 每隔 100ms 检查一次取消信号，大幅降低延迟
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                if cancel_signal.load(Ordering::SeqCst) {
-                    tasks.abort_all();
-                    let _ = fs::remove_dir_all(&temp_dir);
-                    println!("🛑 任务被用户取消，正在清理临时文件...");
-                    return Err("EXPORT_CANCELLED".into());
-                }
-            }
-        }
-    }
-
-    // 4. 使用 FFmpeg Concat Demuxer 秒级合并
-    if cancel_signal.load(Ordering::SeqCst) {
-        let _ = fs::remove_dir_all(&temp_dir);
-        return Err("EXPORT_CANCELLED".into());
-    }
-    
+    // 阶段 7: 合并片段
     println!("并行任务全部完成，正在合并 {} 个片段...", completed);
-    if let Some(ref win) = window {
-        let _ = win.emit("video-progress", serde_json::json!({
-            "percent": 95.0, 
-            "message": "正在进行最后的无损合并...",
-            "eta": 1.0
-        }));
-    }
-    let concat_file_path = temp_dir.join("list.txt");
-    let mut concat_file = fs::File::create(&concat_file_path)?;
-    for i in 0..num_batches {
-        // 确保按顺序写入
-        writeln!(concat_file, "file 'part_{}.ts'", i)?;
-    }
-    concat_file.flush()?;
-
-    let mut concat_cmd = TokioCommand::new(ffmpeg_path);
-    concat_cmd.args(&[
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concat_file_path.to_str().unwrap(),
-        "-c", "copy", // 仅仅是拷贝，不重编码，速度极快
-        "-movflags", "+faststart",
-        "-y",
-        output_path
-    ]);
-
-    let status = concat_cmd.status().await?;
+    notifier.emit_merging();
     
-    // 清理临时文件
-    let _ = fs::remove_dir_all(&temp_dir);
+    ConcatMerger::merge(ffmpeg_path, &temp_dir, output_path, completed).await?;
 
+    // 阶段 8: 清理临时文件
+    TempDirManager::cleanup(&temp_dir);
+
+    // 阶段 9: 构建结果
     let processing_time = start_time.elapsed().as_secs_f64();
-    if status.success() {
-        println!("✅ 并行处理成功！耗时: {:.2}s", processing_time);
-        if let Some(ref win) = window {
-            let _ = win.emit("video-progress", serde_json::json!({ "percent": 100.0, "message": "处理完成" }));
-        }
-        Ok(ProcessResult {
-            input_path: input_path.to_string(),
-            output_path: output_path.to_string(),
-            original_duration,
-            processed_duration,
-            silence_segments: silences.len(),
-            total_silence_removed,
-            compression_ratio: (total_silence_removed / original_duration) * 100.0,
-            processing_time,
-            success: true,
-            error_message: None,
-        })
-    } else {
-        Err("合并片段失败".into())
-    }
+    println!("✅ 并行处理成功！耗时: {:.2}s", processing_time);
+    notifier.emit_complete();
+
+    Ok(ProcessResultBuilder::build(
+        input_path, output_path,
+        original_duration, processed_duration,
+        silences.len(), total_silence_removed,
+        processing_time,
+        true, None,
+    ))
 }
 
 // 内部函数：处理一个批次的片段到一个 TS 文件
