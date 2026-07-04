@@ -52,35 +52,31 @@ jobs:
           $outputDir = "src-tauri/target/release/bundle/msix_out"
           New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 
+          # 1. 提取 MSI 到临时目录
+          $extractDir = New-Item -ItemType Directory -Path "src-tauri/target/release/bundle/msi_extract" -Force
           Write-Host "Extracting MSI content..."
-          Start-Process msiexec.exe -ArgumentList "/a `"$msiPath`" /qb TARGETDIR=`"$($stageDir.FullName)`"" -Wait
+          Start-Process msiexec.exe -ArgumentList "/a `"$msiPath`" /qb TARGETDIR=`"$($extractDir.FullName)`"" -Wait
 
-          # 将子目录内的所有内容移出来，彻底展平到 stage 根目录下
-          $innerDir = Get-ChildItem -Path $stageDir.FullName -Directory | Select-Object -First 1
-          if ($innerDir) {
-              Write-Host "Flattening directory structure from $($innerDir.FullName)"
-              Get-ChildItem -Path $innerDir.FullName -Recurse | ForEach-Object {
-                  $targetPath = $_.FullName.Replace($innerDir.FullName, $stageDir.FullName)
-                  if ($_.PSIsContainer) {
-                      New-Item -ItemType Directory -Path $targetPath -Force | Out-Null
-                  } else {
-                      $null = New-Item -ItemType File -Path $targetPath -Force
-                      Copy-Item -Path $_.FullName -Destination $targetPath -Force
-                  }
+          # 2. 强力展平：递归遍历所有文件，把它们直接拷贝到 stage 根目录（排除掉那个原始的 msi 文件）
+          Write-Host "Flattening deep directories into stage root..."
+          Get-ChildItem -Path $extractDir.FullName -Recurse -File | ForEach-Object {
+              if ($_.Extension -ne ".msi") {
+                  # 保持文件直接躺在 stage 根目录下
+                  $targetPath = Join-Path $stageDir.FullName $_.Name
+                  Copy-Item -Path $_.FullName -Destination $targetPath -Force
               }
-              Remove-Item $innerDir.FullName -Recurse -Force
           }
 
-          Write-Host "Files in stage directory after flattening:"
-          Get-ChildItem -Path $stageDir.FullName -Recurse -File | ForEach-Object { Write-Host "  $($_.FullName)" }
+          Write-Host "Files in stage directory after violent flattening:"
+          Get-ChildItem -Path $stageDir.FullName -File | ForEach-Object { Write-Host "  $($_.FullName)" }
 
-          # 在展平后的根目录下直接找到可执行文件
+          # 3. 这时候主程序绝对百分百躺在根目录了
           $mainExe = Get-ChildItem -Path $stageDir.FullName -Filter "*.exe" | Where-Object { $_.Name -notmatch "unins|msiexec" } | Select-Object -First 1
           if (-not $mainExe) {
             Write-Error "No main executable found in stage directory"
             exit 1
           }
-          Write-Host "Main executable: $($mainExe.Name)"
+          Write-Host "Main executable found: $($mainExe.Name)"
 
           $publisherCN = "${{ secrets.MICROSOFT_PUBLISHER_CN }}"
           if ([string]::IsNullOrEmpty($publisherCN)) { $publisherCN = "CN=mr_tang_temporary" }
@@ -115,6 +111,7 @@ jobs:
           "@
           Set-Content -Path $manifestPath -Value $manifestContent -Encoding UTF8
 
+          # 4. 塞入图标文件夹，防止 Manifest 校验找不到图标报错
           Copy-Item -Path "src-tauri/icons" -Destination (Join-Path $stageDir.FullName "src-tauri/icons") -Recurse -Force -ErrorAction SilentlyContinue
 
           Write-Host "Locating makeappx.exe..."
@@ -125,6 +122,7 @@ jobs:
           }
           Write-Host "Found makeappx at: $makeappx"
 
+          # 5. 打包成最终的 MSIX
           Write-Host "Packaging to MSIX..."
           & $makeappx pack /d $($stageDir.FullName) /p "$outputDir\silence-cutter_1.0.2_x64.msix" /o
 
