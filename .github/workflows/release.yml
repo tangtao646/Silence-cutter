@@ -83,6 +83,42 @@ jobs:
             chmod +x src-tauri/binaries/ffprobe-${{ matrix.triple }}
           fi
 
+      - name: Repackage MSI to MSIX (Windows Only)
+        if: matrix.platform == 'windows-latest'
+        shell: powershell
+        run: |
+          # 1. 自动定位 Tauri 刚编出来的 msi 文件路径
+          $msiPath = Get-ChildItem -Path "src-tauri/target/release/bundle/msi/*.msi" | Select-Object -First 1 -ExpandProperty FullName
+          Write-Host "Found MSI installer at: $msiPath"
+
+          # 2. 调用 Windows 自带的 MakeAppx 工具直接将其打包转换为 .msix
+          # 注意：这里的 Identity Name 和 Publisher 必须严格匹配你在微软 Partner Center 的数据
+          # 请确保你在 GitHub Secrets 里配置了 MICROSOFT_PUBLISHER_CN (形如 CN=xxxx)
+          $publisherCN = "${{ secrets.MICROSOFT_PUBLISHER_CN }}"
+          
+          # 创建打包清单
+          $manifestContent = @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
+            <Identity Name="8d0d1c17-abcb-42a5-9111-b2c24ce9c5f5" Publisher="$publisherCN" Version="1.0.2.0" ProcessorArchitecture="x64" />
+            <Properties>
+              <DisplayName>Silence Cutter</DisplayName>
+              <PublisherDisplayName>mr_tang</PublisherDisplayName>
+              <Logo>src-tauri\icons\StoreLogo.png</Logo>
+            </Properties>
+            <Resources>
+              <Resource Language="en-us"/>
+            </Resources>
+            <Dependencies>
+              <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22000.0" />
+            </Dependencies>
+            <Capabilities>
+              <rescap:Capability Name="runFullTrust"/>
+            </Capabilities>
+          </Package>
+          "@
+          # 这一步微软的 MSIX 封装工具会自动提取 MSI 的内容并直接封包为 silence-cutter_1.0.2_x64.msix    
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
