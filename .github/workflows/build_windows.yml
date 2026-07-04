@@ -1,0 +1,109 @@
+name: Build Windows
+
+on:
+  workflow_call:
+
+jobs:
+  build-windows:
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install frontend dependencies
+        run: npm install
+
+      - name: Download FFmpeg sidecars (Windows)
+        shell: bash
+        run: |
+          mkdir -p src-tauri/binaries
+          curl -L https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -o ffmpeg.zip
+          unzip -j ffmpeg.zip "**/ffmpeg.exe" -d src-tauri/binaries
+          unzip -j ffmpeg.zip "**/ffprobe.exe" -d src-tauri/binaries
+          mv src-tauri/binaries/ffmpeg.exe src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
+          mv src-tauri/binaries/ffprobe.exe src-tauri/binaries/ffprobe-x86_64-pc-windows-msvc.exe
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: "Silence Cutter v__VERSION__"
+          releaseBody: "See the assets below to download the latest version of Silence Cutter."
+          releaseDraft: false
+          prerelease: false
+
+      - name: Convert MSI to Store-Compliant MSIX
+        shell: powershell
+        run: |
+          $msiPath = Get-ChildItem -Path "src-tauri/target/release/bundle/msi/*.msi" | Select-Object -First 1 -ExpandProperty FullName
+          Write-Host "Found MSI: $msiPath"
+
+          $stageDir = New-Item -ItemType Directory -Path "src-tauri/target/release/bundle/msix_stage" -Force
+          $outputDir = "src-tauri/target/release/bundle/msix_out"
+          New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+
+          Write-Host "Extracting MSI content..."
+          Start-Process msiexec.exe -ArgumentList "/a `"$msiPath`" /qb TARGETDIR=`"$($stageDir.FullName)`"" -Wait
+
+          $innerDir = Get-ChildItem -Path $stageDir.FullName -Directory | Select-Object -First 1
+          if ($innerDir) {
+              Get-ChildItem -Path $innerDir.FullName | Move-Item -Destination $stageDir.FullName -Force
+              Remove-Item $innerDir.FullName -Recurse -Force
+          }
+
+          $publisherCN = "${{ secrets.MICROSOFT_PUBLISHER_CN }}"
+          if ([string]::IsNullOrEmpty($publisherCN)) { $publisherCN = "CN=mr_tang_temporary" }
+
+          $manifestPath = Join-Path $stageDir.FullName "AppxManifest.xml"
+          $manifestContent = @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
+            <Identity Name="8d0d1c17-abcb-42a5-9111-b2c24ce9c5f5" Publisher="$publisherCN" Version="1.0.2.0" ProcessorArchitecture="x64" />
+            <Properties>
+              <DisplayName>Silence Cutter</DisplayName>
+              <PublisherDisplayName>mr_tang</PublisherDisplayName>
+              <Logo>src-tauri\icons\32x32.png</Logo>
+            </Properties>
+            <Resources>
+              <Resource Language="en-us"/>
+            </Resources>
+            <Dependencies>
+              <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22000.0" />
+            </Dependencies>
+            <Capabilities>
+              <rescap:Capability Name="runFullTrust"/>
+            </Capabilities>
+            <Applications>
+              <Application Id="App" Executable="Silence Cutter.exe" EntryPoint="Windows.FullTrustApplication">
+                <uap:VisualElements DisplayName="Silence Cutter" Description="Silence Cutter" BackgroundColor="transparent" Square150x150Logo="src-tauri\icons\128x128.png" Square44x44Logo="src-tauri\icons\32x32.png">
+                  <uap:DefaultTile Wide310x150Logo="src-tauri\icons\128x128.png"/>
+                </uap:VisualElements>
+              </Application>
+            </Applications>
+          </Package>
+          "@
+          Set-Content -Path $manifestPath -Value $manifestContent -Encoding UTF8
+
+          Copy-Item -Path "src-tauri/icons" -Destination (Join-Path $stageDir.FullName "src-tauri/icons") -Recurse -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Packaging to MSIX..."
+          & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\makeappx.exe" pack /d $($stageDir.FullName) /p "$outputDir\silence-cutter_1.0.2_x64.msix" /o
+
+          Write-Host "Successfully generated MSIX file in $outputDir"
+
+      - name: Upload MSIX to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: src-tauri/target/release/bundle/msix_out/*.msix
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

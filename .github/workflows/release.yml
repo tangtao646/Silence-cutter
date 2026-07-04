@@ -1,96 +1,28 @@
-name: "Release"
+name: Release
 
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Select platform to build'
+        required: true
+        type: choice
+        options:
+          - all
+          - mac
+          - windows
+        default: 'all'
 
 jobs:
-  build-tauri:
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: "macos-latest" # For M1/M2 (aarch64)
-            args: "--target aarch64-apple-darwin"
-            triple: "aarch64-apple-darwin"
-          - platform: "macos-latest" # For Intel (x86_64)
-            args: "--target x86_64-apple-darwin"
-            triple: "x86_64-apple-darwin"
-          - platform: "windows-latest"
-            args: ""
-            triple: "x86_64-pc-windows-msvc"
+  build-mac:
+    if: github.event_name == 'push' || github.event.inputs.platform == 'all' || github.event.inputs.platform == 'mac'
+    uses: ./.github/workflows/build_mac.yml
+    secrets: inherit
 
-    runs-on: ${{ matrix.platform }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: setup node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.triple }}
-
-      - name: install dependencies (ubuntu only)
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev libappindicator3-dev librsvg2-dev patchelf
-
-      - name: install frontend dependencies
-        run: npm install
-
-      - name: Download FFmpeg sidecars
-        shell: bash
-        run: |
-          mkdir -p src-tauri/binaries
-          if [ "${{ matrix.platform }}" == "windows-latest" ]; then
-            curl -L https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -o ffmpeg.zip
-            unzip -j ffmpeg.zip "**/ffmpeg.exe" -d src-tauri/binaries
-            unzip -j ffmpeg.zip "**/ffprobe.exe" -d src-tauri/binaries
-            # 重命名必须严格匹配：名字-目标三元组.exe
-            mv src-tauri/binaries/ffmpeg.exe src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
-            mv src-tauri/binaries/ffprobe.exe src-tauri/binaries/ffprobe-x86_64-pc-windows-msvc.exe
-          else
-            # Mac 处理
-            URL_FFMPEG="https://www.osxexperts.net/ffmpeg80intel.zip"
-            URL_FFPROBE="https://www.osxexperts.net/ffprobe80intel.zip"
-            if [ "${{ matrix.triple }}" == "aarch64-apple-darwin" ]; then
-              URL_FFMPEG="https://www.osxexperts.net/ffmpeg80arm.zip"
-              URL_FFPROBE="https://www.osxexperts.net/ffprobe80arm.zip"
-            fi
-            
-            curl -L --http1.1 $URL_FFMPEG -o ffmpeg.zip
-            curl -L --http1.1 $URL_FFPROBE -o ffprobe.zip
-            unzip -o ffmpeg.zip -d src-tauri/binaries
-            unzip -o ffprobe.zip -d src-tauri/binaries
-            
-            # 重命名：名字-目标三元组
-            mv src-tauri/binaries/ffmpeg src-tauri/binaries/ffmpeg-${{ matrix.triple }}
-            mv src-tauri/binaries/ffprobe src-tauri/binaries/ffprobe-${{ matrix.triple }}
-            
-            # 关键步骤：解除 macOS 的损坏拦截
-            xattr -cr src-tauri/binaries/ffmpeg-${{ matrix.triple }}
-            xattr -cr src-tauri/binaries/ffprobe-${{ matrix.triple }}
-            chmod +x src-tauri/binaries/ffmpeg-${{ matrix.triple }}
-            chmod +x src-tauri/binaries/ffprobe-${{ matrix.triple }}
-          fi
-
-      - uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: v__VERSION__ # tauri-action replaces this with version from package.json
-          releaseName: "Silence Cutter v__VERSION__"
-          releaseBody: "See the assets below to download the latest version of Silence Cutter."
-          releaseDraft: false
-          prerelease: false
-          args: ${{ matrix.platform == 'windows-latest' && '--bundles msix' || matrix.args }}
-
+  build-windows:
+    if: github.event_name == 'push' || github.event.inputs.platform == 'all' || github.event.inputs.platform == 'windows'
+    uses: ./.github/workflows/build_windows.yml
+    secrets: inherit

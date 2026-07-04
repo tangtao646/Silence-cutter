@@ -1,0 +1,72 @@
+name: Build macOS
+
+on:
+  workflow_call:
+
+jobs:
+  build-mac:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "macos-latest"
+            args: "--target aarch64-apple-darwin"
+            triple: "aarch64-apple-darwin"
+          - platform: "macos-latest"
+            args: "--target x86_64-apple-darwin"
+            triple: "x86_64-apple-darwin"
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: install frontend dependencies
+        run: npm install
+
+      - name: Download FFmpeg sidecars (macOS)
+        shell: bash
+        run: |
+          mkdir -p src-tauri/binaries
+
+          URL_FFMPEG="https://www.osxexperts.net/ffmpeg80intel.zip"
+          URL_FFPROBE="https://www.osxexperts.net/ffprobe80intel.zip"
+          if [ "${{ matrix.triple }}" == "aarch64-apple-darwin" ]; then
+            URL_FFMPEG="https://www.osxexperts.net/ffmpeg80arm.zip"
+            URL_FFPROBE="https://www.osxexperts.net/ffprobe80arm.zip"
+          fi
+
+          curl -L --http1.1 $URL_FFMPEG -o ffmpeg.zip
+          curl -L --http1.1 $URL_FFPROBE -o ffprobe.zip
+          unzip -o ffmpeg.zip -d src-tauri/binaries
+          unzip -o ffprobe.zip -d src-tauri/binaries
+
+          mv src-tauri/binaries/ffmpeg src-tauri/binaries/ffmpeg-${{ matrix.triple }}
+          mv src-tauri/binaries/ffprobe src-tauri/binaries/ffprobe-${{ matrix.triple }}
+
+          xattr -cr src-tauri/binaries/ffmpeg-${{ matrix.triple }}
+          xattr -cr src-tauri/binaries/ffprobe-${{ matrix.triple }}
+          chmod +x src-tauri/binaries/ffmpeg-${{ matrix.triple }}
+          chmod +x src-tauri/binaries/ffprobe-${{ matrix.triple }}
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: "Silence Cutter v__VERSION__"
+          releaseBody: "See the assets below to download the latest version of Silence Cutter."
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
