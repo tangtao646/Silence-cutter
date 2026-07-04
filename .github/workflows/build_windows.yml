@@ -45,36 +45,47 @@ jobs:
       - name: Convert MSI to Store-Compliant MSIX
         shell: powershell
         run: |
-          $msiPath = Get-ChildItem -Path "src-tauri/target/release/bundle/msi/*.msi" | Select-Object -First 1 -ExpandProperty FullName
-          Write-Host "Found MSI: $msiPath"
+          $msiPath = Get-ChildItem -Path "src-tauri/target/release/bundle/msi/*.msi" | Select-Object -First 1 -ExpandProperty FullName[cite: 3]
+          Write-Host "Found MSI: $msiPath"[cite: 3]
 
-          $stageDir = New-Item -ItemType Directory -Path "src-tauri/target/release/bundle/msix_stage" -Force
-          $outputDir = "src-tauri/target/release/bundle/msix_out"
-          New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+          $stageDir = New-Item -ItemType Directory -Path "src-tauri/target/release/bundle/msix_stage" -Force[cite: 3]
+          $outputDir = "src-tauri/target/release/bundle/msix_out"[cite: 3]
+          New-Item -ItemType Directory -Path $outputDir -Force | Out-Null[cite: 3]
 
-          Write-Host "Extracting MSI content..."
-          Start-Process msiexec.exe -ArgumentList "/a `"$msiPath`" /qb TARGETDIR=`"$($stageDir.FullName)`"" -Wait
+          Write-Host "Extracting MSI content..."[cite: 3]
+          Start-Process msiexec.exe -ArgumentList "/a `"$msiPath`" /qb TARGETDIR=`"$($stageDir.FullName)`"" -Wait[cite: 3]
 
-          $innerDir = Get-ChildItem -Path $stageDir.FullName -Directory | Select-Object -First 1
+          # 🚀 修复的核心：将子目录内的所有内容移出来，彻底展平到 stage 根目录下
+          $innerDir = Get-ChildItem -Path $stageDir.FullName -Directory | Select-Object -First 1[cite: 3]
           if ($innerDir) {
-              Get-ChildItem -Path $innerDir.FullName | Move-Item -Destination $stageDir.FullName -Force
-              Remove-Item $innerDir.FullName -Recurse -Force
+              Write-Host "Flattening directory structure from $($innerDir.FullName)"
+              Get-ChildItem -Path $innerDir.FullName -Recurse | ForEach-Object {
+                  $targetPath = $_.FullName.Replace($innerDir.FullName, $stageDir.FullName)
+                  if ($_.PSIsContainer) {
+                      New-Item -ItemType Directory -Path $targetPath -Force | Out-Null
+                  } else {
+                      $null = New-Item -ItemType File -Path $targetPath -Force
+                      Copy-Item -Path $_.FullName -Destination $targetPath -Force
+                  }
+              }
+              Remove-Item $innerDir.FullName -Recurse -Force[cite: 3]
           }
 
-          Write-Host "Files in stage directory:"
-          Get-ChildItem -Path $stageDir.FullName -Recurse -File | ForEach-Object { Write-Host "  $($_.FullName)" }
+          Write-Host "Files in stage directory after flattening:"
+          Get-ChildItem -Path $stageDir.FullName -Recurse -File | ForEach-Object { Write-Host "  $($_.FullName)" }[cite: 3]
 
-          $mainExe = Get-ChildItem -Path $stageDir.FullName -Filter "*.exe" | Where-Object { $_.Name -notmatch "unins|msiexec" } | Select-Object -First 1
-          if (-not $mainExe) {
-            Write-Error "No main executable found in stage directory"
-            exit 1
-          }
-          Write-Host "Main executable: $($mainExe.Name)"
+          # 现在能顺利在展平后的根目录下直接找到可执行文件了
+          $mainExe = Get-ChildItem -Path $stageDir.FullName -Filter "*.exe" | Where-Object { $_.Name -notmatch "unins|msiexec" } | Select-Object -First 1[cite: 3]
+          if (-not $mainExe) {[cite: 3]
+            Write-Error "No main executable found in stage directory"[cite: 3]
+            exit 1[cite: 3]
+          }[cite: 3]
+          Write-Host "Main executable: $($mainExe.Name)"[cite: 3]
 
-          $publisherCN = "${{ secrets.MICROSOFT_PUBLISHER_CN }}"
-          if ([string]::IsNullOrEmpty($publisherCN)) { $publisherCN = "CN=mr_tang_temporary" }
+          $publisherCN = "${{ secrets.MICROSOFT_PUBLISHER_CN }}"[cite: 3]
+          if ([string]::IsNullOrEmpty($publisherCN)) { $publisherCN = "CN=mr_tang_temporary" }[cite: 3]
 
-          $manifestPath = Join-Path $stageDir.FullName "AppxManifest.xml"
+          $manifestPath = Join-Path $stageDir.FullName "AppxManifest.xml"[cite: 3]
           $manifestContent = @"
           <?xml version="1.0" encoding="utf-8"?>
           <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
@@ -101,23 +112,23 @@ jobs:
               </Application>
             </Applications>
           </Package>
-          "@
-          Set-Content -Path $manifestPath -Value $manifestContent -Encoding UTF8
+          "@[cite: 3]
+          Set-Content -Path $manifestPath -Value $manifestContent -Encoding UTF8[cite: 3]
 
-          Copy-Item -Path "src-tauri/icons" -Destination (Join-Path $stageDir.FullName "src-tauri/icons") -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item -Path "src-tauri/icons" -Destination (Join-Path $stageDir.FullName "src-tauri/icons") -Recurse -Force -ErrorAction SilentlyContinue[cite: 3]
 
-          Write-Host "Locating makeappx.exe..."
-          $makeappx = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "makeappx.exe" | Where-Object { $_.Directory.Name -eq "x64" } | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $makeappx) {
-            Write-Error "makeappx.exe not found in Windows Kits"
-            exit 1
-          }
-          Write-Host "Found makeappx at: $makeappx"
+          Write-Host "Locating makeappx.exe..."[cite: 3]
+          $makeappx = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "makeappx.exe" | Where-Object { $_.Directory.Name -eq "x64" } | Select-Object -First 1 -ExpandProperty FullName[cite: 3]
+          if (-not $makeappx) {[cite: 3]
+            Write-Error "makeappx.exe not found in Windows Kits"[cite: 3]
+            exit 1[cite: 3]
+          }[cite: 3]
+          Write-Host "Found makeappx at: $makeappx"[cite: 3]
 
-          Write-Host "Packaging to MSIX..."
-          & $makeappx pack /d $($stageDir.FullName) /p "$outputDir\silence-cutter_1.0.2_x64.msix" /o
+          Write-Host "Packaging to MSIX..."[cite: 3]
+          & $makeappx pack /d $($stageDir.FullName) /p "$outputDir\silence-cutter_1.0.2_x64.msix" /o[cite: 3]
 
-          Write-Host "Successfully generated MSIX file in $outputDir"
+          Write-Host "Successfully generated MSIX file in $outputDir"[cite: 3]
 
       - name: Upload MSIX to GitHub Release
         uses: softprops/action-gh-release@v2
