@@ -33,6 +33,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "windows": {
+        "digestAlgorithm": "sha256"
+    },
     "macOS": {
       "dmg": {
         "appPosition": { "x": 180, "y": 170 },
