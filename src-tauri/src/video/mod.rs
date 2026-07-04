@@ -4,7 +4,7 @@
 use crate::audio::SilenceSegment;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::process::Command;
+use std::path::Path;
 use tokio::process::Command as TokioCommand;
 use std::fs;
 use std::io::Write;
@@ -12,7 +12,6 @@ use tauri::Emitter;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::Semaphore;
 
 // ... [skipping middle part for brevity in internal thought but will use full lines in tool call]
 
@@ -54,85 +53,97 @@ pub type ProgressCallback = Box<dyn Fn(f64) + Send>;
 
 // 获取视频信息
 pub async fn get_video_info(ffprobe_path: &str, video_path: &str) -> Result<VideoInfo, Box<dyn std::error::Error>> {
-    // 使用 ffprobe 获取 JSON 格式信息
+    
+    #[derive(Deserialize)]
+    struct FfprobeOutput {
+    streams: Option<Vec<FfprobeStream>>,
+    format: Option<FfprobeFormat>,
+   }
+
+  #[derive(Deserialize)]
+   struct FfprobeStream {
+    codec_type: Option<String>,
+    codec_name: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    avg_frame_rate: Option<String>,
+    duration: Option<String>,
+   }
+
+    #[derive(Deserialize)]
+    struct FfprobeFormat {
+    format_name: Option<String>,
+    duration: Option<String>,
+    bit_rate: Option<String>,
+   }
+    
     let mut cmd = TokioCommand::new(ffprobe_path);
-    cmd.args(&[
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            "-show_streams",
-            video_path,
-        ]);
+    cmd.args(&["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", video_path]);
     
     let output = cmd.output().await?;
-    
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         log::error!("FFprobe failed for {}: {}", video_path, err);
         return Err(format!("FFprobe 执行失败: {}", err).into());
     }
     
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    // 一键反序列化成强类型对象，告警和拼写错误在编译期就被杜绝了
+    let probe_data: FfprobeOutput = serde_json::from_slice(&output.stdout)?;
     
-    // 检查是否有视频流
     let mut has_video = false;
     let mut has_audio = false;
     let mut codec_video = None;
     let mut codec_audio = None;
     let mut resolution = None;
     let mut framerate = None;
+    let mut backup_duration = 0.0;
 
-    if let Some(streams) = json["streams"].as_array() {
+    // 遍历强类型数组，摆脱 .as_array() 和字符串字面量键
+    if let Some(streams) = probe_data.streams {
         for stream in streams {
-            let codec_type = stream["codec_type"].as_str().unwrap_or("");
-            if codec_type == "video" {
-                has_video = true;
-                codec_video = stream["codec_name"].as_str().map(|s| s.to_string());
-                
-                let width = stream["width"].as_u64();
-                let height = stream["height"].as_u64();
-                if let (Some(w), Some(h)) = (width, height) {
-                    resolution = Some((w as u32, h as u32));
-                }
-
-                if let Some(avg_frame_rate) = stream["avg_frame_rate"].as_str() {
-                    if let Some((num, den)) = avg_frame_rate.split_once('/') {
-                        let n = num.parse::<f64>().unwrap_or(0.0);
-                        let d = den.parse::<f64>().unwrap_or(1.0);
-                        if d != 0.0 {
-                            framerate = Some(n / d);
-                        }
+            match stream.codec_type.as_deref() {
+                Some("video") => {
+                    has_video = true;
+                    codec_video = stream.codec_name;
+                    
+                    if let (Some(w), Some(h)) = (stream.width, stream.height) {
+                        resolution = Some((w, h));
+                    }
+                    
+                    if let Some(cfr) = stream.avg_frame_rate.as_deref() {
+                        framerate = parse_framerate(cfr);
+                    }
+                    
+                    if backup_duration == 0.0 {
+                        backup_duration = stream.duration.and_then(|d| d.parse::<f64>().ok()).unwrap_or(0.0);
                     }
                 }
-            } else if codec_type == "audio" {
-                has_audio = true;
-                codec_audio = stream["codec_name"].as_str().map(|s| s.to_string());
+                Some("audio") => {
+                    has_audio = true;
+                    codec_audio = stream.codec_name;
+                }
+                _ => {}
             }
         }
     }
 
-    // 基础文件信息
+    // 基础文件元数据提取
     let size_bytes = fs::metadata(video_path)?.len();
-    let filename = std::path::Path::new(video_path)
+    let filename = Path::new(video_path)
         .file_name()
-        .and_then(|n| n.to_str())
+        .and_then(|n: &std::ffi::OsStr| n.to_str()) 
         .unwrap_or("unknown")
         .to_string();
     
-    // 获取时长
-    let duration = json["format"]["duration"]
-        .as_str()
-        .and_then(|d| d.parse::<f64>().ok())
-        .unwrap_or_else(|| {
-            // 如果 format 没时长，尝试找第一个流的时长
-            json["streams"][0]["duration"]
-                .as_str()
-                .and_then(|d| d.parse::<f64>().ok())
-                .unwrap_or(0.0)
-        });
-    
-    let format = json["format"]["format_name"].as_str().map(|s| s.to_string());
-    let bitrate = json["format"]["bit_rate"].as_str().and_then(|b| b.parse::<u64>().ok());
+    // 从强类型 Format 抽取
+    let (format, duration, bitrate) = match probe_data.format {
+        Some(fmt) => {
+            let d = fmt.duration.and_then(|d| d.parse::<f64>().ok()).unwrap_or(backup_duration);
+            let b = fmt.bit_rate.and_then(|b| b.parse::<u64>().ok());
+            (fmt.format_name, d, b)
+        }
+        None => (None, backup_duration, None),
+    };
     
     Ok(VideoInfo {
         path: video_path.to_string(),
@@ -148,6 +159,14 @@ pub async fn get_video_info(ffprobe_path: &str, video_path: &str) -> Result<Vide
         has_video,
         has_audio,
     })
+}
+
+// === 3. 剥离出的纯计算辅助函数：帧率解析 ===
+fn parse_framerate(fps_str: &str) -> Option<f64> {
+    let (num_str, den_str) = fps_str.split_once('/')?;
+    let n = num_str.parse::<f64>().ok()?;
+    let d = den_str.parse::<f64>().ok()?;
+    if d != 0.0 { Some(n / d) } else { None }
 }
 
 // 内部使用的片段结构
