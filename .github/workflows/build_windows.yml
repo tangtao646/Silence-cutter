@@ -96,8 +96,16 @@ jobs:
 
           Copy-Item -Path "src-tauri/icons" -Destination (Join-Path $stageDir.FullName "src-tauri/icons") -Recurse -Force -ErrorAction SilentlyContinue
 
+          Write-Host "Locating makeappx.exe..."
+          $makeappx = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "makeappx.exe" | Where-Object { $_.Directory.Name -eq "x64" } | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $makeappx) {
+            Write-Error "makeappx.exe not found in Windows Kits"
+            exit 1
+          }
+          Write-Host "Found makeappx at: $makeappx"
+
           Write-Host "Packaging to MSIX..."
-          & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\makeappx.exe" pack /d $($stageDir.FullName) /p "$outputDir\silence-cutter_1.0.2_x64.msix" /o
+          & $makeappx pack /d $($stageDir.FullName) /p "$outputDir\silence-cutter_1.0.2_x64.msix" /o
 
           Write-Host "Successfully generated MSIX file in $outputDir"
 
