@@ -90,6 +90,111 @@ impl SilenceSegment {
     }
 }
 
+// ============================================================
+// 增量静音检测器：随 extract_audio_streaming 流式处理同步检测
+// 避免全量计算完毕后才返回结果，实现"边提取边绘制静音片段"
+// ============================================================
+struct IncrementalSilenceDetector {
+    threshold_linear: f64,
+    min_silence_samples: usize,
+    window_size: usize,
+    sample_rate: u32,
+    last_processed: usize,
+    in_silence: bool,
+    silence_start: usize,
+    silence_energy_sum: f64,
+    silence_windows: usize,
+}
+
+impl IncrementalSilenceDetector {
+    fn new(sample_rate: u32, threshold_db: f64, min_silence_duration: f64) -> Self {
+        let threshold_linear = 10.0f64.powf(threshold_db / 20.0);
+        let min_silence_samples = (min_silence_duration * sample_rate as f64) as usize;
+        let window_size = ((sample_rate as f64) * 0.02) as usize; // 20ms 窗口
+        Self {
+            threshold_linear,
+            min_silence_samples,
+            window_size: window_size.max(1),
+            sample_rate,
+            last_processed: 0,
+            in_silence: false,
+            silence_start: 0,
+            silence_energy_sum: 0.0,
+            silence_windows: 0,
+        }
+    }
+
+    /// 对自上次调用以来新增的样本做增量检测
+    /// 返回本批新确认的完整静音片段（跨批边界未结束的静音保留状态）
+    fn process_new_samples(&mut self, all_samples: &[f32]) -> Vec<SilenceSegment> {
+        let mut new_silences = Vec::new();
+        let available = all_samples.len();
+
+        if available <= self.last_processed || self.window_size == 0 {
+            return new_silences;
+        }
+
+        let start = self.last_processed;
+
+        for window_start in (start..available).step_by(self.window_size) {
+            let window_end = (window_start + self.window_size).min(available);
+            let chunk = &all_samples[window_start..window_end];
+            let energy = calculate_rms(chunk);
+
+            if energy < self.threshold_linear {
+                if !self.in_silence {
+                    self.in_silence = true;
+                    self.silence_start = window_start;
+                    self.silence_energy_sum = energy;
+                    self.silence_windows = 1;
+                } else {
+                    self.silence_energy_sum += energy;
+                    self.silence_windows += 1;
+                }
+            } else if self.in_silence {
+                // 静音段结束
+                self.in_silence = false;
+                let silence_end = window_start;
+                let silence_samples = silence_end - self.silence_start;
+
+                if silence_samples >= self.min_silence_samples {
+                    let start_time = self.silence_start as f64 / self.sample_rate as f64;
+                    let end_time = silence_end as f64 / self.sample_rate as f64;
+                    let average_energy = self.silence_energy_sum / self.silence_windows as f64;
+                    let average_db = linear_to_db(average_energy);
+
+                    new_silences.push(SilenceSegment::new(start_time, end_time, average_db));
+                }
+            }
+        }
+
+        self.last_processed = available;
+        new_silences
+    }
+
+    /// 最终收尾：处理末尾仍在持续的静音段
+    fn finalize(&mut self, all_samples: &[f32]) -> Vec<SilenceSegment> {
+        let mut final_silences = Vec::new();
+
+        if self.in_silence {
+            let silence_end = all_samples.len();
+            let silence_samples = silence_end - self.silence_start;
+
+            if silence_samples >= self.min_silence_samples {
+                let start_time = self.silence_start as f64 / self.sample_rate as f64;
+                let end_time = silence_end as f64 / self.sample_rate as f64;
+                let average_energy = self.silence_energy_sum / self.silence_windows as f64;
+                let average_db = linear_to_db(average_energy);
+
+                final_silences.push(SilenceSegment::new(start_time, end_time, average_db));
+            }
+            self.in_silence = false;
+        }
+
+        final_silences
+    }
+}
+
 // 从视频流式提取音频并实时分析
 pub async fn extract_audio_streaming(
     ffmpeg_path: &str,
@@ -97,7 +202,8 @@ pub async fn extract_audio_streaming(
     video_path: &str,
     sample_rate: u32,
     window: &tauri::Window,
-    _threshold_db: f64,
+    threshold_db: f64,
+    min_silence_duration: f64,
 ) -> Result<AudioData, Box<dyn std::error::Error>> {
     use std::process::Stdio;
     use std::io::Read;
@@ -132,6 +238,16 @@ pub async fn extract_audio_streaming(
     let mut total_samples = 0;
     let mut final_peaks = Vec::new();
 
+    // 初始化增量静音检测器
+    let mut silence_detector = IncrementalSilenceDetector::new(
+        sample_rate,
+        threshold_db,
+        min_silence_duration,
+    );
+
+    // 用于记录流式过程中已经分批发送给前端的所有静音片段，以便最后合并做最终状态同步
+    let mut chunk_samples = Vec::with_capacity(sample_rate as usize * 2); // 临时存放用于增量检测的样本
+
     loop {
         let n = match stdout.read(&mut buffer) {
             Ok(0) => break,
@@ -154,6 +270,7 @@ pub async fn extract_audio_streaming(
             let f32_sample = s16 as f32 / 32768.0;
             
             all_samples.push(f32_sample);
+            chunk_samples.push(f32_sample); // 收集当前批次的增量数据
             total_samples += 1;
             
             // 计算峰值
@@ -164,21 +281,39 @@ pub async fn extract_audio_streaming(
                 peaks.push(current_peak);
                 final_peaks.push(current_peak);
                 
-                // 累计 100 个峰值 (约 2 秒) 发送一次，保证极致性能与响应
+                // 累计 100 个峰值 (约 2 秒) 发送一次波形和静音增量
                 if peaks.len() >= 100 {
                     let mut progress = if duration > 0.0 {
                         (total_samples as f64 / sample_rate as f64) / duration
                     } else {
                         0.0
                     };
-                    
                     if progress > 1.0 { progress = 1.0; }
                     
+                    // 1. 发送波形数据
                     let _ = window.emit("audio-waveform-step", serde_json::json!({
                         "peaks": peaks,
                         "progress": progress,
                     }));
                     peaks = Vec::new();
+
+                    // 2. 真正的增量静音检测：只传入这约 2 秒内新积攒的音频样本 `chunk_samples`
+                    // 这样 Detector 内部的绝对位置游标就不会乱
+                    let new_silences = silence_detector.process_new_samples(&chunk_samples);
+                    if !new_silences.is_empty() {
+                        let _ = window.emit("silence-detect-step", serde_json::json!({
+                            "segments": new_silences.iter().map(|s| {
+                                serde_json::json!({
+                                    "startTime": s.start_time,
+                                    "endTime": s.end_time,
+                                    "duration": s.duration,
+                                    "averageDb": s.average_db,
+                                })
+                            }).collect::<Vec<_>>(),
+                            "progress": progress,
+                        }));
+                    }
+                    chunk_samples.clear(); // 发送完后清空增量池，为下一轮做准备
                 }
                 
                 current_peak = 0.0;
@@ -193,20 +328,44 @@ pub async fn extract_audio_streaming(
         }
     }
 
+    // --- 退出 Loop，开始收尾工作 ---
+
+    // 处理流式末尾最后不足 100 个峰值遗留的 chunk_samples
+    if !chunk_samples.is_empty() {
+        let remaining_silences = silence_detector.process_new_samples(&chunk_samples);
+        if !remaining_silences.is_empty() {
+            let _ = window.emit("silence-detect-step", serde_json::json!({
+                "segments": remaining_silences.iter().map(|s| {
+                    serde_json::json!({
+                        "startTime": s.start_time,
+                        "endTime": s.end_time,
+                        "duration": s.duration,
+                        "averageDb": s.average_db,
+                    })
+                }).collect::<Vec<_>>(),
+                "progress": 1.0,
+            }));
+        }
+    }
+
     let actual_duration = total_samples as f64 / sample_rate as f64;
-    
-    // 关键步骤：存入缓存
     let cache_id = video_path.to_string();
+
+    // 针对整段音频全量跑一次最终检测，用于生成最终完美的、经过 merge_close_silences 缝合的确定版数据
+    // 这样做可以完全规避流式边界处的断裂问题
+    let all_detected = match detect_silences(&cache_id, Some(&all_samples), sample_rate, threshold_db, min_silence_duration) {
+        Ok(res) => res,
+        Err(_) => merge_close_silences(silence_detector.finalize(&all_samples), sample_rate)
+    };
+
+    // 关键步骤：存入缓存
     if let Ok(mut cache) = AUDIO_CACHE.lock() {
         cache.insert(cache_id.clone(), all_samples);
     }
 
-    // 后端打印调试信息
     println!("流式提取完成: {}, 时长: {:.2}s, 峰值数: {}", cache_id, actual_duration, final_peaks.len());
 
-    // 最后发送一次完成状态
-    // 我们允许最多 500,000 个峰值点通过 IPC 发送（约 2MB），
-    // 即使是 5 小时的视频采集通常也在该范围内。
+    // 发送波形最终状态
     let _ = window.emit("audio-waveform-done", serde_json::json!({
         "duration": actual_duration,
         "totalSamples": total_samples,
@@ -214,8 +373,23 @@ pub async fn extract_audio_streaming(
         "peaks": if final_peaks.len() > 500000 { Vec::<f32>::new() } else { final_peaks.clone() }
     }));
 
+    // 发送流式静音检测最终确定事件（前端收到此事件后，用最终的完整 Array 覆盖之前的流式追加缓存，体验最稳健）
+    println!("🔊 流式静音检测最终同步: {} 个静音片段", all_detected.len());
+    let _ = window.emit("silence-detection-done", serde_json::json!({
+        "segments": all_detected.iter().map(|s| {
+            serde_json::json!({
+                "startTime": s.start_time,
+                "endTime": s.end_time,
+                "duration": s.duration,
+                "averageDb": s.average_db,
+            })
+        }).collect::<Vec<_>>(),
+        "duration": actual_duration,
+        "totalSegments": all_detected.len(),
+    }));
+
     Ok(AudioData {
-        samples: None, // 设为 None，不通过 IPC 发送庞大的数组
+        samples: None, 
         peaks: final_peaks,
         sample_rate,
         duration: actual_duration,

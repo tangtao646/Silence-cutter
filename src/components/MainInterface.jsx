@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import { message } from '@tauri-apps/plugin-dialog';
 import LeftPanel from './LeftPanel';
@@ -44,6 +44,10 @@ const MainInterface = ({ appData, isTauri }) => {
     const [exportEta, setExportEta] = useState(0);
     const [timeDisplay, setTimeDisplay] = useState(['15m', '30m', '45m']);
     const [audioDataReady, setAudioDataReady] = useState(0); 
+
+    // 流式静音检测：存储 extract_audio_streaming 中同步产出的增量静音片段
+    const streamedSegmentsRef = useRef(null);
+    const [streamingProgress, setStreamingProgress] = useState(0);
 
     // --- 核心状态变更与历史记录 (Undo) ---
     const commitSegments = useCallback((newSegments, skipHistory = false) => {
@@ -144,6 +148,9 @@ const MainInterface = ({ appData, isTauri }) => {
         return parts.length > 1 ? parts.pop().toUpperCase() : '未知';
     };
 
+    // ==========================================
+    // 1. 修改后的 handleAnalyze 方法
+    // ==========================================
     const handleAnalyze = useCallback(async (overrides = {}) => {
         const targetIntensity = overrides.intensity !== undefined ? overrides.intensity : intensity;
         
@@ -151,110 +158,177 @@ const MainInterface = ({ appData, isTauri }) => {
             return;
         }
 
-        // None 档位逻辑处理：不做任何新的探测处理
         if (targetIntensity === 0) {
             setPendingSegments([]);
             setWaveInfo('Selected Strategy: None (No processing)');
             return;
         }
 
-        // 将 0.0 - 1.0 的强度映射到特定的策略参数（除 Threshold 以外）
-        // 映射逻辑：档位越高，探测越激进 (minSilence 越小)，留白越少 (padding 越小)
-        
         let minSilenceDuration = 0.8;
         let targetPadding = 0.25;
 
         if (targetIntensity <= 0.25) {
-            // Linear between None(3.0) and Natural(0.8)
             const ratio = targetIntensity / 0.25;
             minSilenceDuration = 3.0 - (2.2 * ratio);
-            targetPadding = 0.5 - (0.25 * ratio); // Natural(0.25 intensity) -> 0.25s padding
+            targetPadding = 0.5 - (0.25 * ratio);
         } else if (targetIntensity <= 0.5) {
-            // Linear between Natural(0.8) and Fast(0.5)
             const ratio = (targetIntensity - 0.25) / 0.25;
             minSilenceDuration = 0.8 - (0.3 * ratio);
-            targetPadding = 0.25 - (0.1 * ratio); // Fast(0.5 intensity) -> 0.15s padding
+            targetPadding = 0.25 - (0.1 * ratio);
         } else {
-            // Linear between Fast(0.5) and Super(0.2)
             const ratio = (targetIntensity - 0.5) / 0.5;
             minSilenceDuration = 0.5 - (0.3 * ratio);
-            targetPadding = 0.15 - (0.1 * ratio); // Super(1.0 intensity) -> 0.05s padding
+            targetPadding = 0.15 - (0.1 * ratio);
         }
 
-        // 核心改动：自动同步 Padding 状态，不再提供 UI 调节
         setPadding(targetPadding);
 
-        console.log(`[MainInterface] Starting analysis: Intensity=${targetIntensity.toFixed(2)}, minDur=${minSilenceDuration.toFixed(2)}s, threshold=${threshold}dB (Auto=${isAutoThreshold})`);
-        setWaveInfo('正在分析静音...');
+        console.log(`[MainInterface] Re-analyzing with params: Intensity=${targetIntensity.toFixed(2)}, minDur=${minSilenceDuration.toFixed(2)}s, threshold=${threshold}dB`);
+        setWaveInfo('正在重新分析静音...');
         
         try {
-            const thresholdDb = threshold; // 已经是 dB 单位
+            const thresholdDb = threshold;
             const audioData = appData.state.audioData;
             
+            // 如果是在重新调节滑块（非首次流式处理），一律调用后端的全量检测接口
             const rawSilences = await appData.tauri.detect_silences_with_params({
-                cache_id: audioData.cache_id || currentFile.path, 
+                cache_id: audioData.cache_id || currentFile.path,
                 threshold_db: thresholdDb,
                 min_silence_duration: minSilenceDuration,
                 sample_rate: audioData.sample_rate
             });
 
-            // 人性化处理：应用 Padding (留白)
-            // 每一个静音区间的两头都要缩进一段距离，给说话留下呼吸感，避免“切到字”
-            // 注意：如果静音紧贴着视频开头或结尾，则不应在那个边界加 Padding，否则会导致结尾出现“幽灵片段”
-            const processedSilences = rawSilences
-                .map(s => {
-                    const isAtStart = s.startTime < 0.1;
-                    const isAtEnd = s.endTime > (videoDuration - 0.1);
-                    
-                    const newStart = isAtStart ? 0 : s.startTime + targetPadding;
-                    const newEnd = isAtEnd ? videoDuration : s.endTime - targetPadding;
-                    
-                    return {
-                        ...s,
-                        startTime: newStart,
-                        endTime: newEnd,
-                        duration: Math.max(0, newEnd - newStart)
-                    };
-                })
-                // 如果留白后静音区间消失了（太短了），则忽略该片段
-                .filter(s => s.duration > 0.05);
+            // 统一转换逻辑的辅助函数
+            const processAndMap = (silences) => {
+                return silences
+                    .map(s => {
+                        const isAtStart = s.startTime < 0.1;
+                        const isAtEnd = s.endTime > (videoDuration - 0.1);
+                        const newStart = isAtStart ? 0 : s.startTime + targetPadding;
+                        const newEnd = isAtEnd ? videoDuration : s.endTime - targetPadding;
+                        return {
+                            start: newStart,
+                            end: newEnd,
+                            duration: Math.max(0, newEnd - newStart),
+                            averageDb: s.averageDb,
+                            raw: s
+                        };
+                    })
+                    .filter(s => s.duration > 0.05);
+            };
 
-            console.log(`[MainInterface] Detection finished: ${rawSilences.length} raw -> ${processedSilences.length} padded segments`);
-            appData.state.silenceSegments = processedSilences;
-            
-            // 保持原始数值，仅在呈现时格式化
-            const mappedSegments = processedSilences.map(s => ({
-                start: s.startTime,
-                end: s.endTime,
-                duration: s.duration,
-                averageDb: s.averageDb,
-                raw: s
-            }));
-
-            // 核心改进：只保留“新增”的探测结果。
-            // 如果探测结果包含了已经确认切掉的部分，就通过减法将其剔除。
+            const mappedSegments = processAndMap(rawSilences);
             const newOnly = subtractSegments(mappedSegments, confirmedSegments);
+            
             setPendingSegments(newOnly);
-            
             setExportEnabled(true);
-            setWaveInfo(`当前探测到 ${processedSilences.length} 个建议剪减区`);
-            
-            // Stats 和 TimeDisplay 现在通过 useMemo 自动同步，无需手动 set
+            setWaveInfo(`当前探测到 ${mappedSegments.length} 个建议剪减区`);
         } catch (error) {
             console.error('Analysis failed:', error);
             setWaveInfo('分析失败');
         }
-    }, [currentFile, intensity, threshold, padding, videoDuration, appData, fileInfo.hasAudio]);
+    }, [currentFile, intensity, threshold, padding, videoDuration, appData, confirmedSegments]);
 
-    // 自动化检测 Effect：主要用于处理滑块的防抖重算
+
+    // ==========================================
+    // 2. 修改后的流式事件监听 Effect
+    // ==========================================
     useEffect(() => {
+        if (!appData.tauri || !appData.tauri.listen) return;
+
+        let unlistenStep = null;
+        let unlistenDone = null;
+        let cancelled = false;
+
+        // 根据当前的 padding 动态转换增量片段
+        const convertRawToSegment = (s) => {
+            const isAtStart = s.startTime < 0.1;
+            const isAtEnd = s.endTime > (videoDuration - 0.1);
+            const newStart = isAtStart ? 0 : s.startTime + padding;
+            const newEnd = isAtEnd ? videoDuration : s.endTime - padding;
+            return {
+                start: newStart,
+                end: newEnd,
+                duration: Math.max(0, newEnd - newStart),
+                averageDb: s.averageDb,
+                raw: s
+            };
+        };
+
+        const setup = async () => {
+            // 增量事件：将后端抛出的增量静音直接转化为前端能够渲染的 pendingSegments
+            unlistenStep = await appData.tauri.listen('silence-detect-step', (event) => {
+                if (cancelled) return;
+                const { segments, progress } = event.payload || {};
+                
+                if (segments && segments.length > 0) {
+                    // 转换后端发来的原始数据
+                    const newSegments = segments
+                        .map(convertRawToSegment)
+                        .filter(s => s.duration > 0.05);
+
+                    // 实时追加到 pending 探测层，从而让前端波形图实时画出红框/色块！
+                    setPendingSegments(prev => {
+                        const combined = [...prev, ...newSegments];
+                        // 实时排除掉已经被用户“确认切除”的部分
+                        return subtractSegments(combined, confirmedSegments);
+                    });
+                }
+                
+                if (progress !== undefined) {
+                    setStreamingProgress(progress);
+                    setWaveInfo(`正在流式检测静音片段... ${(progress * 100).toFixed(0)}%`);
+                }
+            });
+
+            // 完成事件：全量最终数据落盘校准
+            unlistenDone = await appData.tauri.listen('silence-detection-done', (event) => {
+                if (cancelled) return;
+                const { segments, totalSegments } = event.payload || {};
+                
+                if (segments) {
+                    const finalSegments = segments
+                        .map(convertRawToSegment)
+                        .filter(s => s.duration > 0.05);
+                    
+                    // 用最终精准的闭环合并数据覆盖流式期间杂乱的追加数据
+                    const newOnly = subtractSegments(finalSegments, confirmedSegments);
+                    setPendingSegments(newOnly);
+                }
+
+                setStreamingProgress(1.0);
+                setExportEnabled(true);
+                setWaveInfo(`静音检测完成！共找到 ${totalSegments ?? 0} 个建议剪减区`);
+                console.log(`[MainInterface] Streaming silence detection done: ${totalSegments} segments`);
+            });
+        };
+
+        setup();
+        return () => {
+            cancelled = true;
+            if (unlistenStep) unlistenStep();
+            if (unlistenDone) unlistenDone();
+        };
+    }, [appData.tauri, padding, videoDuration, confirmedSegments]);
+
+
+    // ==========================================
+    // 3. 修改自动化滑块检测 Effect（加上流式保护锁）
+    // ==========================================
+    useEffect(() => {
+        // 关键改动：如果 streamingProgress 处于 0 ~ 1.0 之间（意味着正在流式提取中）
+        // 强行拦截并短路防抖函数，防止流式结束的瞬间触发 handleAnalyze 导致数据重置
+        if (streamingProgress > 0 && streamingProgress < 1.0) {
+            return;
+        }
+
         if (currentFile && appData.state.audioData) {
             const timer = setTimeout(() => {
                 handleAnalyze();
             }, 400); 
             return () => clearTimeout(timer);
         }
-    }, [threshold, padding, intensity, currentFile?.path, audioDataReady, handleAnalyze]);
+    }, [threshold, padding, intensity, currentFile?.path, audioDataReady, streamingProgress, handleAnalyze]);
 
     const handleFileSelect = async (info) => {
         console.log('[MainInterface] File selected:', info);
@@ -286,6 +360,9 @@ const MainInterface = ({ appData, isTauri }) => {
         setExportEnabled(false);
         setExportProgress(0);
         setVideoDuration(0);
+        // 清空流式静音检测结果，防止跨文件污染
+        streamedSegmentsRef.current = null;
+        setStreamingProgress(0);
 
         const isAudioOnly = /\.(mp3|wav|m4a|flac|aac|ogg)$/i.test(info.name);
 

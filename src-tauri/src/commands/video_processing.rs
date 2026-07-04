@@ -85,7 +85,7 @@ pub async fn extract_audio(
     }));
     
     // 调用我们在 audio/mod.rs 中定义的流式处理函数
-    let result = audio::extract_audio_streaming(&ffmpeg_path, &ffprobe_path, &path, sample_rate, &window, -40.0).await;
+    let result = audio::extract_audio_streaming(&ffmpeg_path, &ffprobe_path, &path, sample_rate, &window, -36.0, 0.5).await;
     
     result.map_err(|e| {
         println!("提取音频失败: {}", e);
