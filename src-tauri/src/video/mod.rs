@@ -405,6 +405,7 @@ impl ConcatMerger {
         temp_dir: &Path,
         output_path: &str,
         num_batches: usize,
+        has_video: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let concat_file_path = temp_dir.join("list.txt");
         let mut concat_file = fs::File::create(&concat_file_path)?;
@@ -419,11 +420,22 @@ impl ConcatMerger {
             "-f", "concat",
             "-safe", "0",
             "-i", concat_file_path.to_str().unwrap(),
-            "-c", "copy", // 仅仅是拷贝，不重编码，速度极快
-            "-movflags", "+faststart",
-            "-y",
-            output_path
         ]);
+
+        if has_video {
+            // 视频：音视频流拷贝 + MP4 快速启动优化
+            concat_cmd.args(&[
+                "-c", "copy",
+                "-movflags", "+faststart",
+            ]);
+        } else {
+            // 纯音频：只拷贝音频流，不加 MP4 专属选项
+            concat_cmd.args(&[
+                "-c:a", "copy",
+            ]);
+        }
+
+        concat_cmd.args(&["-y", output_path]);
 
         let status = concat_cmd.status().await?;
         
@@ -529,13 +541,23 @@ pub async fn remove_silence_from_video(
     let video_info = get_video_info(ffprobe_path, input_path).await?;
     let original_duration = video_info.duration;
 
+    // 纯音频素材：输出强制使用 .m4a 容器（管线已将音频重编码为 AAC，原容器可能不兼容）
+    let output_path = if !video_info.has_video {
+        let mut p = PathBuf::from(output_path);
+        p.set_extension("m4a");
+        println!("🔊 检测到纯音频素材，输出格式调整为: {}", p.display());
+        p.to_string_lossy().to_string()
+    } else {
+        output_path.to_string()
+    };
+
     // 阶段 2: 分析片段
     notifier.emit_analysis();
 
     if silences.is_empty() {
-        fs::copy(input_path, output_path)?;
+        fs::copy(input_path, &output_path)?;
         return Ok(ProcessResultBuilder::build(
-            input_path, output_path,
+            input_path, &output_path,
             original_duration, original_duration,
             0, 0.0,
             start_time.elapsed().as_secs_f64(),
@@ -554,7 +576,7 @@ pub async fn remove_silence_from_video(
     let processed_duration = original_duration - total_silence_removed;
 
     // 阶段 4: 创建临时目录
-    let temp_dir = TempDirManager::create(output_path)?;
+    let temp_dir = TempDirManager::create(&output_path)?;
     let cancel_checker = CancelChecker::new(&cancel_signal, &temp_dir);
 
     println!("🚀 工业级并行化: {} 片段 -> {} 批次 (每批 10)", 
@@ -583,7 +605,7 @@ pub async fn remove_silence_from_video(
     println!("并行任务全部完成，正在合并 {} 个片段...", completed);
     notifier.emit_merging();
     
-    ConcatMerger::merge(ffmpeg_path, &temp_dir, output_path, completed).await?;
+    ConcatMerger::merge(ffmpeg_path, &temp_dir, &output_path, completed, video_info.has_video).await?;
 
     // 阶段 8: 清理临时文件
     TempDirManager::cleanup(&temp_dir);
@@ -594,7 +616,7 @@ pub async fn remove_silence_from_video(
     notifier.emit_complete();
 
     Ok(ProcessResultBuilder::build(
-        input_path, output_path,
+        input_path, &output_path,
         original_duration, processed_duration,
         silences.len(), total_silence_removed,
         processing_time,

@@ -215,7 +215,7 @@ pub async fn process_video(
         silence_segments: result.silence_segments,
         total_silence_removed: result.total_silence_removed,
         compression_ratio: result.compression_ratio,
-        output_path,
+        output_path: result.output_path,
         processing_time,
     })
 }
