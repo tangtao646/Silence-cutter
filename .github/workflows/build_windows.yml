@@ -61,6 +61,16 @@ jobs:
               Remove-Item $innerDir.FullName -Recurse -Force
           }
 
+          Write-Host "Files in stage directory:"
+          Get-ChildItem -Path $stageDir.FullName -Recurse -File | ForEach-Object { Write-Host "  $($_.FullName)" }
+
+          $mainExe = Get-ChildItem -Path $stageDir.FullName -Filter "*.exe" | Where-Object { $_.Name -notmatch "unins|msiexec" } | Select-Object -First 1
+          if (-not $mainExe) {
+            Write-Error "No main executable found in stage directory"
+            exit 1
+          }
+          Write-Host "Main executable: $($mainExe.Name)"
+
           $publisherCN = "${{ secrets.MICROSOFT_PUBLISHER_CN }}"
           if ([string]::IsNullOrEmpty($publisherCN)) { $publisherCN = "CN=mr_tang_temporary" }
 
@@ -84,7 +94,7 @@ jobs:
               <rescap:Capability Name="runFullTrust"/>
             </Capabilities>
             <Applications>
-              <Application Id="App" Executable="Silence Cutter.exe" EntryPoint="Windows.FullTrustApplication">
+              <Application Id="App" Executable="$($mainExe.Name)" EntryPoint="Windows.FullTrustApplication">
                 <uap:VisualElements DisplayName="Silence Cutter" Description="Silence Cutter" BackgroundColor="transparent" Square150x150Logo="src-tauri\icons\128x128.png" Square44x44Logo="src-tauri\icons\32x32.png">
                   <uap:DefaultTile Wide310x150Logo="src-tauri\icons\128x128.png"/>
                 </uap:VisualElements>
