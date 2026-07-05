@@ -78,6 +78,12 @@ jobs:
           }
           Write-Host "Main executable found: $($mainExe.Name)"
 
+          # 动态提取版本号 从 package.json 获取前三位，并在末尾补上 .0 变成微软要求的四位规范
+          $rawVersion = Get-Content -Raw -Path "package.json" | ConvertFrom-Json | Select-Object -ExpandProperty version
+          $msixVersion = "$rawVersion.0"
+          Write-Host "Dynamic MSIX Version determined: $msixVersion"
+
+          # 从你创建的 GitHub Secret 中读取合规的发布者标识
           $publisherCN = "${{ secrets.MICROSOFT_PUBLISHER_CN }}"
           if ([string]::IsNullOrEmpty($publisherCN)) { $publisherCN = "CN=mr_tang_temporary" }
 
@@ -85,7 +91,8 @@ jobs:
           $manifestContent = @"
           <?xml version="1.0" encoding="utf-8"?>
           <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
-            <Identity Name="8d0d1c17-abcb-42a5-9111-b2c24ce9c5f5" Publisher="$publisherCN" Version="1.0.2.0" ProcessorArchitecture="x64" />
+            <!--  修复点：Identity Name 换成了微软要求的 mrtang.Sliencecutter ；Version 使用动态提取的值 -->
+            <Identity Name="mrtang.Sliencecutter" Publisher="$publisherCN" Version="$msixVersion" ProcessorArchitecture="x64" />
             <Properties>
               <DisplayName>Silence Cutter</DisplayName>
               <PublisherDisplayName>mr_tang</PublisherDisplayName>
@@ -122,9 +129,9 @@ jobs:
           }
           Write-Host "Found makeappx at: $makeappx"
 
-          # 5. 打包成最终的 MSIX
+          # 5. 打包成最终的 MSIX (文件名也通过变量改为动态获取，防止多版本冲突)
           Write-Host "Packaging to MSIX..."
-          & $makeappx pack /d $($stageDir.FullName) /p "$outputDir\silence-cutter_1.0.2_x64.msix" /o
+          & $makeappx pack /d $($stageDir.FullName) /p "$outputDir\silence-cutter_${rawVersion}_x64.msix" /o
 
           Write-Host "Successfully generated MSIX file in $outputDir"
 

@@ -1,7 +1,7 @@
 {
   "productName": "silence-cutter",
   "version": "1.0.2",
-  "identifier": "com.silencecutter.app",
+  "identifier": "mrtang.Sliencecutter",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
