@@ -64,7 +64,7 @@ jobs:
             exit 1
           }
           
-          # 【已修复】使用标准的 .Substring() 方法计算主程序相对于 stage 根目录的相对路径
+          # 计算主程序相对于 stage 根目录的相对路径
           $executableRelativePath = $mainExe.FullName.Substring($stageDir.FullName.Length + 1)
           Write-Host "Main executable relative path for Manifest: $executableRelativePath"
 
@@ -74,9 +74,13 @@ jobs:
           $publisherCN = "${{ secrets.MICROSOFT_PUBLISHER_CN }}"
           if ([string]::IsNullOrEmpty($publisherCN)) { $publisherCN = "CN=mr_tang_temporary" }
 
-          # 5. 生成清单文件 (把 Manifest 丢在 stage 根目录)
+          # 5. 【已修复】提前把图标文件夹拷过去，确保打包时物理路径存在
+          Copy-Item -Path "src-tauri/icons" -Destination (Join-Path $stageDir.FullName "src-tauri/icons") -Recurse -Force -ErrorAction SilentlyContinue
+
+          # 6. 生成清单文件 (把 Manifest 丢在 stage 根目录)
           $manifestPath = Join-Path $stageDir.FullName "AppxManifest.xml"
 
+          # 【关键修复点】Logo 和 VisualElements 的 Logo 全部改用拷贝过去的真正图片相对路径
           $manifestContent = @"
           <?xml version="1.0" encoding="utf-8"?>
           <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
@@ -84,7 +88,7 @@ jobs:
             <Properties>
               <DisplayName>Silence Cutter</DisplayName>
               <PublisherDisplayName>mr_tang</PublisherDisplayName>
-              <Logo>$executableRelativePath</Logo> 
+              <Logo>src-tauri\icons\32x32.png</Logo> 
             </Properties>
             <Resources>
               <Resource Language="en-us"/>
@@ -97,16 +101,13 @@ jobs:
             </Capabilities>
             <Applications>
               <Application Id="App" Executable="$executableRelativePath" EntryPoint="Windows.FullTrustApplication">
-                <uap:VisualElements DisplayName="Silence Cutter" Description="Silence Cutter" BackgroundColor="transparent" Square150x150Logo="$executableRelativePath" Square44x44Logo="$executableRelativePath">
+                <uap:VisualElements DisplayName="Silence Cutter" Description="Silence Cutter" BackgroundColor="transparent" Square150x150Logo="src-tauri\icons\128x128.png" Square44x44Logo="src-tauri\icons\32x32.png">
                 </uap:VisualElements>
               </Application>
             </Applications>
           </Package>
           "@
           Set-Content -Path $manifestPath -Value $manifestContent -Encoding UTF8
-
-          # 6. 塞入图标文件夹，防止 Manifest 校验找不到图标报错
-          Copy-Item -Path "src-tauri/icons" -Destination (Join-Path $stageDir.FullName "src-tauri/icons") -Recurse -Force -ErrorAction SilentlyContinue
 
           Write-Host "Locating makeappx.exe..."
           $makeappx = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "makeappx.exe" | Where-Object { $_.Directory.Name -eq "x64" } | Select-Object -First 1 -ExpandProperty FullName
