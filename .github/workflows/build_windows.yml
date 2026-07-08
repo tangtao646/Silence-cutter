@@ -133,9 +133,9 @@ jobs:
 
       # 明确指定 tag_name 告诉它传到哪里
       - name: Upload MSIX to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: ncipollo/release-action@v1
         with:
-          tag_name: ${{ steps.get_version.outputs.tag }}
-          files: src-tauri/target/release/bundle/msix_out/*.msix
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          allowUpdates: true
+          tag: ${{ steps.get_version.outputs.tag }}
+          artifacts: "src-tauri/target/release/bundle/msix_out/*.msix"
+          token: ${{ secrets.GITHUB_TOKEN }}
