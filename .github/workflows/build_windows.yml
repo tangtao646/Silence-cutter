@@ -48,39 +48,62 @@ jobs:
           $msiPath = Get-ChildItem -Path "src-tauri/target/release/bundle/msi/*.msi" | Select-Object -First 1 -ExpandProperty FullName
           Write-Host "Found MSI: $msiPath"
 
-          # 1. 直接创建最终打包的 stage 目录
           $stageDir = New-Item -ItemType Directory -Path "src-tauri/target/release/bundle/msix_stage" -Force
           $outputDir = "src-tauri/target/release/bundle/msix_out"
           New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 
-          # 2. 直接把 MSI 静默释放到 stage 根目录下，绝对不要破坏和展平它的文件夹结构！
-          Write-Host "Extracting MSI content directly to stage directory keeping structures..."
+          # 1. 释放 MSI
+          Write-Host "Extracting MSI content..."
           Start-Process msiexec.exe -ArgumentList "/a `"$msiPath`" /qb TARGETDIR=`"$($stageDir.FullName)`"" -Wait
 
-          # 3. 顺着 Tauri 的 MSI 默认安装路径去定位主 exe。
-          $mainExe = Get-ChildItem -Path $stageDir.FullName -Recurse -Filter "*.exe" | Where-Object { $_.Name -notmatch "unins|msiexec|ffmpeg|ffprobe" } | Select-Object -First 1
+          # 2. 【核心修复：干掉 %20 畸形文件夹】
+          # 检查是否存在带有 %20 的讨厌文件夹，直接把它重命名为标准空格
+          $percentDir = Get-ChildItem -Path "$($stageDir.FullName)\PFiles" -Directory | Where-Object { $_.Name -like "*%20*" } | Select-Object -First 1
+          if ($percentDir) {
+              Write-Host "Found anomalous %20 directory: $($percentDir.FullName)"
+              $cleanName = $percentDir.Name -replace "%20", " "
+              Rename-Item -Path $percentDir.FullName -NewName $cleanName -Force
+              Write-Host "Successfully renamed to standard space: $cleanName"
+          }
+
+          # 3. 定位到洗干净后的程序根目录
+          $appDir = Get-ChildItem -Path "$($stageDir.FullName)\PFiles" -Directory | Select-Object -First 1
+          Write-Host "Target App Directory inside VFS: $($appDir.FullName)"
+
+          # 4. 【核心修复：物理强制归位 FFmpeg 侧载组件】
+          # 既然打包出来丢在了根目录，我们手动在里面帮 Rust 创建标准的 binaries 文件夹，并改好规范的后缀名！
+          $binariesDir = New-Item -ItemType Directory -Path (Join-Path $appDir.FullName "binaries") -Force
+          
+          # 把平铺在根目录的 ffmpeg.exe 挪进去并重命名为标准 Sidecar 格式
+          if (Test-Path (Join-Path $appDir.FullName "ffmpeg.exe")) {
+              Move-Item -Path (Join-Path $appDir.FullName "ffmpeg.exe") -Destination (Join-Path $binariesDir.FullName "ffmpeg-x86_64-pc-windows-msvc.exe") -Force
+              Write-Host "Manually routed ffmpeg to binaries/ with correct target target sidecar name."
+          }
+          if (Test-Path (Join-Path $appDir.FullName "ffprobe.exe")) {
+              Move-Item -Path (Join-Path $appDir.FullName "ffprobe.exe") -Destination (Join-Path $binariesDir.FullName "ffprobe-x86_64-pc-windows-msvc.exe") -Force
+              Write-Host "Manually routed ffprobe to binaries/ with correct target target sidecar name."
+          }
+
+          # 5. 寻找主程序可执行文件
+          $mainExe = Get-ChildItem -Path $appDir.FullName -Filter "silence-cutter.exe" | Select-Object -First 1
           if (-not $mainExe) {
-            Write-Error "No main executable found in stage directory"
+            Write-Error "silence-cutter.exe not found in standard target directory!"
             exit 1
           }
           
-          # 计算主程序相对于 stage 根目录的相对路径
+          # 计算完美、无畸形的 AppxManifest 相对路径
           $executableRelativePath = $mainExe.FullName.Substring($stageDir.FullName.Length + 1)
           Write-Host "Main executable relative path for Manifest: $executableRelativePath"
 
-          # 4. 动态提取版本号和发布者
+          # 6. 动态生成干净的清单文件
           $rawVersion = Get-Content -Raw -Path "package.json" | ConvertFrom-Json | Select-Object -ExpandProperty version
           $msixVersion = "$rawVersion.0"
           $publisherCN = "${{ secrets.MICROSOFT_PUBLISHER_CN }}"
           if ([string]::IsNullOrEmpty($publisherCN)) { $publisherCN = "CN=mr_tang_temporary" }
 
-          # 5. 【已修复】提前把图标文件夹拷过去，确保打包时物理路径存在
           Copy-Item -Path "src-tauri/icons" -Destination (Join-Path $stageDir.FullName "src-tauri/icons") -Recurse -Force -ErrorAction SilentlyContinue
-
-          # 6. 生成清单文件 (把 Manifest 丢在 stage 根目录)
           $manifestPath = Join-Path $stageDir.FullName "AppxManifest.xml"
 
-          # 【关键修复点】Logo 和 VisualElements 的 Logo 全部改用拷贝过去的真正图片相对路径
           $manifestContent = @"
           <?xml version="1.0" encoding="utf-8"?>
           <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
@@ -109,19 +132,13 @@ jobs:
           "@
           Set-Content -Path $manifestPath -Value $manifestContent -Encoding UTF8
 
+          # 7. 找寻编译器打包
           Write-Host "Locating makeappx.exe..."
           $makeappx = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "makeappx.exe" | Where-Object { $_.Directory.Name -eq "x64" } | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $makeappx) {
-            Write-Error "makeappx.exe not found in Windows Kits"
-            exit 1
-          }
-          Write-Host "Found makeappx at: $makeappx"
-
-          # 7. 打包成最终的 MSIX
-          Write-Host "Packaging to MSIX..."
+          
+          Write-Host "Packaging to finalized store-compliant MSIX..."
           & $makeappx pack /d $($stageDir.FullName) /p "$outputDir\silence-cutter_${rawVersion}_x64.msix" /o
-
-          Write-Host "Successfully generated MSIX file in $outputDir"
+          Write-Host "Successfully generated healthy MSIX!"
 
       # 增加一步：动态读取项目版本号（从 package.json）
       - name: Get App Version for Release
