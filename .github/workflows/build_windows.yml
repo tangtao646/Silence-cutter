@@ -48,72 +48,60 @@ jobs:
           $msiPath = Get-ChildItem -Path "src-tauri/target/release/bundle/msi/*.msi" | Select-Object -First 1 -ExpandProperty FullName
           Write-Host "Found MSI: $msiPath"
 
+          # 1. 直接创建最终打包的 stage 目录
           $stageDir = New-Item -ItemType Directory -Path "src-tauri/target/release/bundle/msix_stage" -Force
           $outputDir = "src-tauri/target/release/bundle/msix_out"
           New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 
-          # 1. 提取 MSI 到临时目录
-          $extractDir = New-Item -ItemType Directory -Path "src-tauri/target/release/bundle/msi_extract" -Force
-          Write-Host "Extracting MSI content..."
-          Start-Process msiexec.exe -ArgumentList "/a `"$msiPath`" /qb TARGETDIR=`"$($extractDir.FullName)`"" -Wait
+          # 2. 【合规修改】直接把 MSI 静默释放到 stage 根目录下，绝对不要破坏和展平它的文件夹结构！
+          Write-Host "Extracting MSI content directly to stage directory keeping structures..."
+          Start-Process msiexec.exe -ArgumentList "/a `"$msiPath`" /qb TARGETDIR=`"$($stageDir.FullName)`"" -Wait
 
-          # 2. 强力展平：递归遍历所有文件，把它们直接拷贝到 stage 根目录（排除掉那个原始的 msi 文件）
-          Write-Host "Flattening deep directories into stage root..."
-          Get-ChildItem -Path $extractDir.FullName -Recurse -File | ForEach-Object {
-              if ($_.Extension -ne ".msi") {
-                  # 保持文件直接躺在 stage 根目录下
-                  $targetPath = Join-Path $stageDir.FullName $_.Name
-                  Copy-Item -Path $_.FullName -Destination $targetPath -Force
-              }
-          }
-
-          Write-Host "Files in stage directory after violent flattening:"
-          Get-ChildItem -Path $stageDir.FullName -File | ForEach-Object { Write-Host "  $($_.FullName)" }
-
-          # 3. 这时候主程序绝对百分百躺在根目录了
-          $mainExe = Get-ChildItem -Path $stageDir.FullName -Filter "*.exe" | Where-Object { $_.Name -notmatch "unins|msiexec" } | Select-Object -First 1
+          # 3. 【合规修改】顺着 Tauri 的 MSI 默认安装路径去定位主 exe。通常它会老老实实在 PFiles/下
+          $mainExe = Get-ChildItem -Path $stageDir.FullName -Recurse -Filter "*.exe" | Where-Object { $_.Name -notmatch "unins|msiexec|ffmpeg|ffprobe" } | Select-Object -First 1
           if (-not $mainExe) {
-            Write-Error "No main executable found in stage directory"
-            exit 1
+          Write-Error "No main executable found in stage directory"
+          exit 1
           }
-          Write-Host "Main executable found: $($mainExe.Name)"
+          # 拿到主程序相对于 stage 根目录的相对路径
+          $executableRelativePath = Substring ($mainExe.FullName.Length - $stageDir.FullName.Length - 1)
+          Write-Host "Main executable relative path for Manifest: $executableRelativePath"
 
-          # 动态提取版本号 从 package.json 获取前三位，并在末尾补上 .0 变成微软要求的四位规范
+          # 4. 动态提取版本号和发布者
           $rawVersion = Get-Content -Raw -Path "package.json" | ConvertFrom-Json | Select-Object -ExpandProperty version
           $msixVersion = "$rawVersion.0"
-          Write-Host "Dynamic MSIX Version determined: $msixVersion"
-
-          # 从你创建的 GitHub Secret 中读取合规的发布者标识
           $publisherCN = "${{ secrets.MICROSOFT_PUBLISHER_CN }}"
           if ([string]::IsNullOrEmpty($publisherCN)) { $publisherCN = "CN=mr_tang_temporary" }
 
+          # 5. 生成清单文件 (把 Manifest 丢在 stage 根目录)
           $manifestPath = Join-Path $stageDir.FullName "AppxManifest.xml"
+
+          # 【关键点】在 Manifest 中，Executable 的值必须指向它真实的深层相对路径！
           $manifestContent = @"
           <?xml version="1.0" encoding="utf-8"?>
           <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
-            <!--  修复点：Identity Name 换成了微软要求的 mrtang.Sliencecutter ；Version 使用动态提取的值 -->
-            <Identity Name="mrtang.Sliencecutter" Publisher="$publisherCN" Version="$msixVersion" ProcessorArchitecture="x64" />
-            <Properties>
-              <DisplayName>Silence Cutter</DisplayName>
-              <PublisherDisplayName>mr_tang</PublisherDisplayName>
-              <Logo>src-tauri\icons\32x32.png</Logo>
-            </Properties>
-            <Resources>
-              <Resource Language="en-us"/>
-            </Resources>
-            <Dependencies>
-              <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22000.0" />
-            </Dependencies>
-            <Capabilities>
-              <rescap:Capability Name="runFullTrust"/>
-            </Capabilities>
-            <Applications>
-              <Application Id="App" Executable="$($mainExe.Name)" EntryPoint="Windows.FullTrustApplication">
-                <uap:VisualElements DisplayName="Silence Cutter" Description="Silence Cutter" BackgroundColor="transparent" Square150x150Logo="src-tauri\icons\128x128.png" Square44x44Logo="src-tauri\icons\32x32.png">
-                  <uap:DefaultTile Wide310x150Logo="src-tauri\icons\128x128.png"/>
-                </uap:VisualElements>
-              </Application>
-            </Applications>
+           <Identity Name="mrtang.Sliencecutter" Publisher="$publisherCN" Version="$msixVersion" ProcessorArchitecture="x64" />
+           <Properties>
+            <DisplayName>Silence Cutter</DisplayName>
+            <PublisherDisplayName>mr_tang</PublisherDisplayName>
+            <!-- 【注意】确保你的图标在解压出来的物理路径中存在，或者在这里使用主程序自带的图标资源 -->
+            <Logo>$executableRelativePath</Logo> 
+           </Properties>
+          <Resources>
+          <Resource Language="en-us"/>
+          </Resources>
+          <Dependencies>
+          <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22000.0" />
+          </Dependencies>
+          <Capabilities>
+          <rescap:Capability Name="runFullTrust"/>
+          </Capabilities>
+          <Applications>
+          <Application Id="App" Executable="$executableRelativePath" EntryPoint="Windows.FullTrustApplication">
+          <uap:VisualElements DisplayName="Silence Cutter" Description="Silence Cutter" BackgroundColor="transparent" Square150x150Logo="$executableRelativePath" Square44x44Logo="$executableRelativePath">
+          </uap:VisualElements>
+          </Application>
+          </Applications>
           </Package>
           "@
           Set-Content -Path $manifestPath -Value $manifestContent -Encoding UTF8
